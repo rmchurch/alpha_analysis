@@ -12,6 +12,9 @@ The dataset reads:
       ``losses/losses/energy``, but ``losses/energy`` is also supported as a
       fallback.
     - when requested, ``bfield.h5``: ``br``, ``bphi``, and ``bz``.
+
+Set ``include_target=False`` for self-supervised or temporal profile tasks that
+do not use the scalar loss target.
 """
 
 import json
@@ -32,6 +35,7 @@ DEFAULT_EQUILIBRIUM_FILENAME = "desc_equilibrium.h5"
 DEFAULT_BFIELD_FILENAME = "bfield.h5"
 BFIELD_DATASETS = ("br", "bphi", "bz")
 BFIELD_COORDINATE_DATASETS = ("rho", "theta", "phi")
+PROFILE_TIME_DATASET = "profiles/time"
 TARGET_DATASET_CANDIDATES = ("losses/losses/energy", "losses/energy")
 DEFAULT_TARGET_DATABASE_KEY = "fraction_lost"
 
@@ -257,6 +261,7 @@ class Ascot5Dataset(Dataset):
         target_database_path: Union[PathLike, None] = None,
         target_database_key: str = DEFAULT_TARGET_DATABASE_KEY,
         allow_missing_target_database: bool = False,
+        include_target: bool = True,
     ) -> None:
         del ascot_filename
         self.include_bfield = include_bfield
@@ -269,9 +274,10 @@ class Ascot5Dataset(Dataset):
             strict=strict,
         )
         self.target_database: Union[Dict[str, float], None] = None
+        self.include_target = include_target
         self.target_database_key = target_database_key
         self.allow_missing_target_database = allow_missing_target_database
-        if target_database_path is not None:
+        if include_target and target_database_path is not None:
             database_path = Path(target_database_path).expanduser()
             if not database_path.is_file():
                 raise FileNotFoundError(f"Target database does not exist: {database_path}")
@@ -308,9 +314,14 @@ class Ascot5Dataset(Dataset):
             z_lmn = _read_required_dataset(equilibrium_file, "_Z_lmn")
             prs_para = _read_required_dataset(analysis_file, "profiles/prs_para")
             prs_perp = _read_required_dataset(analysis_file, "profiles/prs_perp")
-            if self.target_database is None:
+            profile_time = (
+                _read_required_dataset(analysis_file, PROFILE_TIME_DATASET)
+                if PROFILE_TIME_DATASET in analysis_file
+                else torch.arange(prs_para.shape[0], dtype=torch.float32)
+            )
+            if self.include_target and self.target_database is None:
                 target = _read_target_dataset(analysis_file)
-            else:
+            elif self.include_target:
                 sample_key = _sample_database_key(sample_paths.folder)
                 if sample_key in self.target_database:
                     target = torch.tensor(
@@ -332,12 +343,14 @@ class Ascot5Dataset(Dataset):
             "folder": str(sample_paths.folder),
             "prs_para": prs_para,
             "prs_perp": prs_perp,
+            "profile_time": profile_time,
             "context": {
                 "R_lmn": r_lmn,
                 "Z_lmn": z_lmn,
             },
-            "target": target,
         }
+        if self.include_target:
+            sample["target"] = target
         if self.include_bfield:
             if sample_paths.bfield_path is None:
                 raise ValueError(f"No bfield file is configured for {sample_paths.folder}")
@@ -471,6 +484,7 @@ __all__ = [
     "DEFAULT_BFIELD_FILENAME",
     "DEFAULT_EQUILIBRIUM_FILENAME",
     "DEFAULT_TARGET_DATABASE_KEY",
+    "PROFILE_TIME_DATASET",
     "Ascot5Dataset",
     "TARGET_DATASET_CANDIDATES",
     "build_simulation_dataloader",
