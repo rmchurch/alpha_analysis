@@ -31,6 +31,8 @@ train-alpha-transolver = "alpha_analysis.ai.train_transolver:main"
 train-alpha-transolver-timedependent = "alpha_analysis.ai.train_transolver_timedependent:main"
 export-alpha-transolver-slice-tokens = "alpha_analysis.ai.export_transolver_slice_tokens:main"
 train-alpha-latent-generator = "alpha_analysis.ai.train_latent_generator:main"
+train-alpha-grid-autoencoder = "alpha_analysis.ai.train_grid_autoencoder:main"
+export-alpha-grid-latents = "alpha_analysis.ai.export_grid_latents:main"
 
 # Explicit package discovery to ensure all modules are included when building wheels.
 [tool.setuptools.packages.find]
