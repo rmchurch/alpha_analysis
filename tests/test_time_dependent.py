@@ -1,6 +1,10 @@
+import h5py
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from alpha_analysis.ai import dataloader as dataloader_module
+from alpha_analysis.ai.dataloader import Ascot5Dataset
 from alpha_analysis.ai.time_dependent import (
     TemporalWindowDataset,
     append_predicted_frames,
@@ -40,6 +44,62 @@ def test_temporal_windows_support_multi_input_and_output():
     assert second["input_indices"].tolist() == [1, 2]
     assert second["target_indices"].tolist() == [3, 4]
     assert second["input_times"].tolist() == [0.25, 0.5]
+
+
+def test_ascot_temporal_windows_read_only_selected_frames_and_cache_static_data(
+    tmp_path, monkeypatch
+):
+    folder = tmp_path / "sample"
+    folder.mkdir()
+    values = np.arange(5 * 2 * 3, dtype=np.float64).reshape(5, 2, 3)
+    with h5py.File(folder / "analysis_results.h5", "w") as analysis_file:
+        analysis_file.create_dataset("profiles/prs_para", data=values)
+        analysis_file.create_dataset("profiles/prs_perp", data=values + 100)
+        analysis_file.create_dataset("profiles/time", data=np.arange(5) * 0.25)
+    with h5py.File(folder / "desc_equilibrium.h5", "w") as equilibrium_file:
+        equilibrium_file.create_dataset("_R_lmn", data=np.arange(3))
+        equilibrium_file.create_dataset("_Z_lmn", data=np.arange(3) + 10)
+    with h5py.File(folder / "bfield.h5", "w") as bfield_file:
+        for offset, name in enumerate(("br", "bphi", "bz")):
+            bfield_file.create_dataset(name, data=np.full((2, 3), offset + 1.0))
+
+    bfield_reads = []
+    original_read_bfield = dataloader_module._read_bfield_file
+
+    def counted_read_bfield(path):
+        bfield_reads.append(path)
+        return original_read_bfield(path)
+
+    monkeypatch.setattr(dataloader_module, "_read_bfield_file", counted_read_bfield)
+    simulations = Ascot5Dataset(
+        [folder],
+        include_bfield=True,
+        include_target=False,
+        temporal_static_cache_size=2,
+    )
+    windows = TemporalWindowDataset(
+        simulations,
+        input_frames=2,
+        output_frames=1,
+    )
+
+    first = windows[0]
+    second = windows[1]
+    assert second["input_indices"].tolist() == [1, 2]
+    assert second["target_indices"].tolist() == [3]
+    torch.testing.assert_close(second["input_prs_para"], torch.tensor(values[1:3]).float())
+    torch.testing.assert_close(
+        second["target_prs_perp"], torch.tensor(values[3:4] + 100).float()
+    )
+    assert second["input_times"].tolist() == [0.25, 0.5]
+    assert "prs_para" not in second
+    assert "context" not in second
+    assert len(bfield_reads) == 1
+    assert first["bfield"] is second["bfield"]
+
+    complete_sample = simulations[0]
+    assert complete_sample["prs_para"].shape == (5, 2, 3)
+    assert "context" in complete_sample
 
 
 def test_profile_node_channel_round_trip():

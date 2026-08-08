@@ -109,12 +109,21 @@ class TemporalWindowDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         window = self.windows[index]
-        sample = self.dataset[window.sample_index]
         all_indices = window.start + torch.arange(
             self.input_frames + self.output_frames, dtype=torch.long
         ) * self.frame_stride
         input_indices = all_indices[: self.input_frames]
         target_indices = all_indices[self.input_frames :]
+
+        temporal_reader = getattr(self.dataset, "read_temporal_window", None)
+        if callable(temporal_reader):
+            return temporal_reader(
+                window.sample_index,
+                input_indices.tolist(),
+                target_indices.tolist(),
+            )
+
+        sample = self.dataset[window.sample_index]
 
         result = dict(sample)
         result.update(

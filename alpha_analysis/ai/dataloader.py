@@ -18,6 +18,7 @@ do not use the scalar loss target.
 """
 
 import json
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
@@ -128,6 +129,23 @@ def _read_required_dataset(h5_file: h5py.File, dataset_name: str) -> Tensor:
     if dataset_name not in h5_file:
         raise KeyError(f"Missing dataset '{dataset_name}' in {h5_file.filename}")
     return torch.as_tensor(h5_file[dataset_name][...], dtype=torch.float32)
+
+
+def _read_required_frames(
+    h5_file: h5py.File,
+    dataset_name: str,
+    frame_indices: Sequence[int],
+) -> Tensor:
+    """Read only selected leading-axis frames from an HDF5 dataset."""
+
+    if dataset_name not in h5_file:
+        raise KeyError(f"Missing dataset '{dataset_name}' in {h5_file.filename}")
+    indices = [int(index) for index in frame_indices]
+    if not indices:
+        raise ValueError("At least one frame index is required.")
+    if indices != sorted(set(indices)):
+        raise ValueError(f"Frame indices must be sorted and unique; received {indices}.")
+    return torch.as_tensor(h5_file[dataset_name][indices, ...], dtype=torch.float32)
 
 
 def _read_target_dataset(h5_file: h5py.File) -> Tensor:
@@ -262,6 +280,7 @@ class Ascot5Dataset(Dataset):
         target_database_key: str = DEFAULT_TARGET_DATABASE_KEY,
         allow_missing_target_database: bool = False,
         include_target: bool = True,
+        temporal_static_cache_size: int = 64,
     ) -> None:
         del ascot_filename
         self.include_bfield = include_bfield
@@ -277,6 +296,10 @@ class Ascot5Dataset(Dataset):
         self.include_target = include_target
         self.target_database_key = target_database_key
         self.allow_missing_target_database = allow_missing_target_database
+        if temporal_static_cache_size < 0:
+            raise ValueError("temporal_static_cache_size must be nonnegative.")
+        self.temporal_static_cache_size = temporal_static_cache_size
+        self._temporal_static_cache: OrderedDict[int, Dict[str, Any]] = OrderedDict()
         if include_target and target_database_path is not None:
             database_path = Path(target_database_path).expanduser()
             if not database_path.is_file():
@@ -304,6 +327,75 @@ class Ascot5Dataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def _temporal_static_sample(self, index: int) -> Dict[str, Any]:
+        """Return simulation-invariant temporal inputs from a per-worker LRU cache."""
+
+        if index in self._temporal_static_cache:
+            sample = self._temporal_static_cache.pop(index)
+            self._temporal_static_cache[index] = sample
+            return sample
+
+        sample_paths = self.samples[index]
+        sample: Dict[str, Any] = {"folder": str(sample_paths.folder)}
+        if self.include_bfield:
+            if sample_paths.bfield_path is None:
+                raise ValueError(f"No bfield file is configured for {sample_paths.folder}")
+            sample["bfield"] = _read_bfield_file(sample_paths.bfield_path)
+
+        if self.temporal_static_cache_size > 0:
+            self._temporal_static_cache[index] = sample
+            while len(self._temporal_static_cache) > self.temporal_static_cache_size:
+                self._temporal_static_cache.popitem(last=False)
+        return sample
+
+    def read_temporal_window(
+        self,
+        index: int,
+        input_indices: Sequence[int],
+        target_indices: Sequence[int],
+    ) -> Dict[str, Any]:
+        """Read one temporal window without loading the complete profile history."""
+
+        input_list = [int(value) for value in input_indices]
+        target_list = [int(value) for value in target_indices]
+        all_indices = [*input_list, *target_list]
+        if all_indices != sorted(set(all_indices)):
+            raise ValueError(
+                "Temporal input and target indices must be sorted and unique; "
+                f"received {all_indices}."
+            )
+
+        sample_paths = self.samples[index]
+        with h5py.File(sample_paths.analysis_path, "r") as analysis_file:
+            prs_para = _read_required_frames(
+                analysis_file, "profiles/prs_para", all_indices
+            )
+            prs_perp = _read_required_frames(
+                analysis_file, "profiles/prs_perp", all_indices
+            )
+            if PROFILE_TIME_DATASET in analysis_file:
+                profile_time = _read_required_frames(
+                    analysis_file, PROFILE_TIME_DATASET, all_indices
+                )
+            else:
+                profile_time = torch.tensor(all_indices, dtype=torch.float32)
+
+        input_count = len(input_list)
+        result = dict(self._temporal_static_sample(index))
+        result.update(
+            {
+                "input_prs_para": prs_para[:input_count],
+                "input_prs_perp": prs_perp[:input_count],
+                "target_prs_para": prs_para[input_count:],
+                "target_prs_perp": prs_perp[input_count:],
+                "input_times": profile_time[:input_count],
+                "target_times": profile_time[input_count:],
+                "input_indices": torch.tensor(input_list, dtype=torch.long),
+                "target_indices": torch.tensor(target_list, dtype=torch.long),
+            }
+        )
+        return result
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         sample_paths = self.samples[index]

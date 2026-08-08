@@ -23,7 +23,6 @@ from .time_dependent import TemporalWindowDataset, profiles_to_node_channels
 from .train_transolver import (
     TransolverPlusModel,
     _bfield_channels,
-    _cleanup_distributed,
     _coordinate_features,
     _discover_sample_folders,
     _ensure_distributed,
@@ -166,9 +165,12 @@ def run_epoch(
             losses.append(float(loss.detach().cpu()))
             maes.append(float(mae.detach().cpu()))
 
+    if not losses:
+        raise RuntimeError("The DataLoader produced no batches.")
+
     return {
-        "mse": sum(losses) / max(len(losses), 1),
-        "mae": sum(maes) / max(len(maes), 1),
+        "mse": sum(losses) / len(losses),
+        "mae": sum(maes) / len(maes),
     }
 
 
@@ -206,6 +208,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--temporal-static-cache-size",
+        type=int,
+        default=64,
+        help="B-field samples cached independently by each DataLoader worker.",
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Resume from a checkpoint and continue at the following epoch.",
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1.0e-4)
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
@@ -250,6 +264,7 @@ def _build_window_dataset(
         include_bfield=True,
         include_target=False,
         strict=True,
+        temporal_static_cache_size=args.temporal_static_cache_size,
     )
     return TemporalWindowDataset(
         simulations,
@@ -268,6 +283,8 @@ def _save_checkpoint(
     model_config: Dict[str, Any],
     args: argparse.Namespace,
     metrics: Dict[str, float],
+    best_val: float,
+    batch_generator: torch.Generator,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -278,6 +295,13 @@ def _save_checkpoint(
             "model_config": model_config,
             "args": vars(args),
             "metrics": metrics,
+            "best_val": best_val,
+            "rng_state": {
+                "torch": torch.get_rng_state(),
+                "python": random.getstate(),
+                "batch_generator": batch_generator.get_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            },
             "feature_layout": {
                 "input": [
                     "rho",
@@ -301,8 +325,8 @@ def _save_checkpoint(
                 ],
                 "output": [
                     f"{field}_t+{(frame + 1) * args.frame_stride}"
-                    for frame in range(args.output_frames)
-                    for field in ("prs_para", "prs_perp")
+                        for frame in range(args.output_frames)
+                        for field in ("prs_para", "prs_perp")
                 ],
             },
         },
@@ -310,12 +334,98 @@ def _save_checkpoint(
     )
 
 
+_RESUME_FIXED_ARGS = (
+    "analysis_filename",
+    "equilibrium_filename",
+    "bfield_filename",
+    "input_frames",
+    "output_frames",
+    "frame_stride",
+    "window_stride",
+    "max_samples",
+    "train_fraction",
+    "seed",
+    "lr",
+    "weight_decay",
+    "grad_clip",
+    "max_nodes",
+    "no_profile_log1p",
+    "hidden_dim",
+    "layers",
+    "heads",
+    "slice_num",
+    "dropout",
+    "mlp_ratio",
+)
+
+
+def _validate_resume_args(checkpoint: Dict[str, Any], args: argparse.Namespace) -> None:
+    saved_args = checkpoint.get("args", {})
+    mismatches = []
+    for name in _RESUME_FIXED_ARGS:
+        if name not in saved_args:
+            continue
+        current = getattr(args, name)
+        saved = saved_args[name]
+        if current != saved:
+            mismatches.append(f"{name}: checkpoint={saved!r}, current={current!r}")
+    if mismatches:
+        raise ValueError(
+            "Resume settings change the data/model trajectory; use the original values "
+            "for these options (batch size and num workers may change): "
+            + "; ".join(mismatches)
+        )
+
+
+def _restore_rng_state(
+    checkpoint: Dict[str, Any],
+    batch_generator: torch.Generator,
+) -> None:
+    state = checkpoint.get("rng_state")
+    if not state:
+        print(
+            "Resume checkpoint has no RNG state; continuing with a fresh RNG sequence."
+        )
+        return
+    torch.set_rng_state(state["torch"])
+    random.setstate(state["python"])
+    batch_generator.set_state(state["batch_generator"])
+    cuda_state = state.get("cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
 def main() -> None:
     args = build_parser().parse_args()
     if not (0.0 < args.train_fraction <= 1.0):
         raise ValueError("--train-fraction must be in (0, 1].")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be nonnegative.")
+    if args.temporal_static_cache_size < 0:
+        raise ValueError("--temporal-static-cache-size must be nonnegative.")
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive.")
     if args.max_nodes is not None and args.max_nodes <= 0:
         raise ValueError("--max-nodes must be positive when provided.")
+
+    resume_checkpoint: Dict[str, Any] | None = None
+    resume_path: Path | None = None
+    if args.resume is not None:
+        resume_path = args.resume.expanduser().resolve()
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint does not exist: {resume_path}")
+        resume_checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
+        _validate_resume_args(resume_checkpoint, args)
+        resume_epoch = int(resume_checkpoint.get("epoch", 0))
+        if resume_epoch <= 0:
+            raise ValueError(f"Resume checkpoint has invalid epoch {resume_epoch}.")
+        if args.epochs <= resume_epoch:
+            raise ValueError(
+                f"--epochs ({args.epochs}) must be greater than checkpoint epoch "
+                f"({resume_epoch}) to perform a restart."
+            )
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -339,6 +449,8 @@ def main() -> None:
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=_identity_collate,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     val_loader = (
         DataLoader(
@@ -347,12 +459,16 @@ def main() -> None:
             shuffle=False,
             num_workers=args.num_workers,
             collate_fn=_identity_collate,
+            persistent_workers=args.num_workers > 0,
+            prefetch_factor=2 if args.num_workers > 0 else None,
         )
         if val_dataset is not None
         else None
     )
 
     batch_generator = torch.Generator().manual_seed(args.seed)
+    validation_generator = torch.Generator().manual_seed(args.seed + 1)
+    validation_generator_state = validation_generator.get_state().clone()
     first_x, _, first_target = sample_to_temporal_tensors(
         train_dataset[0],
         max_nodes=min(args.max_nodes or 1024, 1024),
@@ -378,6 +494,26 @@ def main() -> None:
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
+    start_epoch = 1
+    best_val = float("inf")
+    history: List[Dict[str, float]] = []
+    if resume_checkpoint is not None:
+        checkpoint_model_config = resume_checkpoint.get("model_config")
+        if checkpoint_model_config != model_config:
+            raise ValueError(
+                "Resume checkpoint model configuration does not match the current "
+                f"arguments:\ncheckpoint={checkpoint_model_config!r}\n"
+                f"current={model_config!r}"
+            )
+        model.load_state_dict(resume_checkpoint["model_state_dict"])
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        start_epoch = int(resume_checkpoint["epoch"]) + 1
+        metrics = resume_checkpoint.get("metrics", {})
+        best_val = float(
+            resume_checkpoint.get("best_val", metrics.get("val_mse", float("inf")))
+        )
+        _restore_rng_state(resume_checkpoint, batch_generator)
+
     print(
         f"Training on {len(train_folders)} simulations / {len(train_dataset)} windows"
         + (
@@ -386,7 +522,9 @@ def main() -> None:
             else ""
         )
         + f"; input_frames={args.input_frames}, output_frames={args.output_frames}, "
-        f"input_dim={input_dim}, output_dim={output_dim}, device={device}."
+        f"input_dim={input_dim}, output_dim={output_dim}, batch_size={args.batch_size}, "
+        f"num_workers={args.num_workers}, static_cache_size={args.temporal_static_cache_size}, "
+        f"deterministic_validation=True, device={device}."
     )
 
     if args.dry_run:
@@ -404,17 +542,45 @@ def main() -> None:
             f"dry_run x={tuple(x.shape)} pos={tuple(pos.shape)} "
             f"target={tuple(target.shape)} prediction={tuple(prediction.shape)}"
         )
-        _cleanup_distributed()
         return
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
     with (args.save_dir / "config.json").open("w") as file:
-        json.dump({"args": vars(args), "model_config": model_config}, file, indent=2, default=str)
+        json.dump(
+            {"args": vars(args), "model_config": model_config},
+            file,
+            indent=2,
+            default=str,
+        )
 
-    best_val = float("inf")
-    history: List[Dict[str, float]] = []
+    if resume_checkpoint is not None and resume_path is not None:
+        source_metrics_path = resume_path.parent / "metrics.jsonl"
+        if source_metrics_path.is_file():
+            with source_metrics_path.open() as file:
+                for line in file:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    if int(row["epoch"]) < start_epoch:
+                        history.append(row)
+            with (args.save_dir / "metrics.jsonl").open("w") as file:
+                for row in history:
+                    file.write(json.dumps(row) + "\n")
+        if "best_val" not in resume_checkpoint:
+            historical_values = [
+                float(row["val_mse"])
+                for row in history
+                if "val_mse" in row
+            ]
+            if historical_values:
+                best_val = min(historical_values)
+        print(
+            f"Resuming from {resume_path} at epoch {start_epoch}; "
+            f"target epoch {args.epochs}; best_val={best_val:.6g}."
+        )
+
     start = time.time()
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = run_epoch(
             model,
             train_loader,
@@ -429,13 +595,16 @@ def main() -> None:
             "train_mae": train_metrics["mae"],
         }
         if val_loader is not None:
+            # Reset validation sampling so metric changes reflect model changes,
+            # not a different random node subset on each epoch.
+            validation_generator.set_state(validation_generator_state)
             val_metrics = run_epoch(
                 model,
                 val_loader,
                 optimizer=None,
                 device=device,
                 args=args,
-                generator=batch_generator,
+                generator=validation_generator,
             )
             metrics.update({"val_mse": val_metrics["mse"], "val_mae": val_metrics["mae"]})
             if val_metrics["mse"] < best_val:
@@ -448,6 +617,8 @@ def main() -> None:
                     model_config,
                     args,
                     metrics,
+                    best_val,
+                    batch_generator,
                 )
 
         history.append(metrics)
@@ -468,6 +639,8 @@ def main() -> None:
                 model_config,
                 args,
                 metrics,
+                best_val,
+                batch_generator,
             )
 
     _save_checkpoint(
@@ -478,9 +651,12 @@ def main() -> None:
         model_config,
         args,
         history[-1],
+        best_val,
+        batch_generator,
     )
-    print(f"Finished in {time.time() - start:.1f}s. Checkpoints written to {args.save_dir}")
-    _cleanup_distributed()
+    print(
+        f"Finished in {time.time() - start:.1f}s. Checkpoints written to {args.save_dir}"
+    )
 
 
 if __name__ == "__main__":
