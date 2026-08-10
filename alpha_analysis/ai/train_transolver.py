@@ -40,6 +40,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on local instal
     ) from exc
 
 
+_REDUCE_ATTENTION_ACROSS_RANKS = True
+
+
 def _node_to_slice_tokens(x_mid: Tensor, slice_weights: Tensor) -> Tensor:
     if not x_mid.is_cuda:
         return torch.einsum("bhnc,bhng->bhgc", x_mid, slice_weights).contiguous()
@@ -84,9 +87,10 @@ def _patched_attention_forward(self: Physics_Attention_1D_Eidetic, x: Tensor) ->
     temperature = torch.clamp(temperature, min=0.01)
     slice_weights = gumbel_softmax(self.in_project_slice(x_mid), temperature)
     slice_norm = slice_weights.sum(2)
-    dist_nn.all_reduce(slice_norm, op=dist.ReduceOp.SUM)
     slice_token = _node_to_slice_tokens(x_mid, slice_weights)
-    dist_nn.all_reduce(slice_token, op=dist.ReduceOp.SUM)
+    if _REDUCE_ATTENTION_ACROSS_RANKS:
+        dist_nn.all_reduce(slice_norm, op=dist.ReduceOp.SUM)
+        dist_nn.all_reduce(slice_token, op=dist.ReduceOp.SUM)
     slice_token = slice_token / (
         (slice_norm + 1.0e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head)
     )
@@ -105,9 +109,18 @@ def _patched_attention_forward(self: Physics_Attention_1D_Eidetic, x: Tensor) ->
     return self.to_out(out_x)
 
 
-def patch_transolver_attention_for_cuda() -> None:
-    """Avoid a failing CUDA strided-batched GEMM path in this environment."""
+def patch_transolver_attention_for_cuda(*, data_parallel: bool = False) -> None:
+    """Patch attention and configure its process-group semantics.
 
+    The upstream attention reduces slice tokens across the default process
+    group to support node/domain decomposition. Standard DDP gives every rank
+    different samples, so those activation reductions would incorrectly mix
+    independent batches. In data-parallel mode DDP synchronizes gradients and
+    attention remains local to each rank.
+    """
+
+    global _REDUCE_ATTENTION_ACROSS_RANKS
+    _REDUCE_ATTENTION_ACROSS_RANKS = not data_parallel
     Physics_Attention_1D_Eidetic.forward = _patched_attention_forward
 
 

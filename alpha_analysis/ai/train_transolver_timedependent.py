@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 
 from .dataloader import (
     DEFAULT_ANALYSIS_FILENAME,
@@ -23,6 +26,7 @@ from .time_dependent import TemporalWindowDataset, profiles_to_node_channels
 from .train_transolver import (
     TransolverPlusModel,
     _bfield_channels,
+    _cleanup_distributed,
     _coordinate_features,
     _discover_sample_folders,
     _ensure_distributed,
@@ -30,6 +34,46 @@ from .train_transolver import (
     _pad_node_tensors,
     patch_transolver_attention_for_cuda,
 )
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Partition evaluation data across ranks without padding or duplication."""
+
+    def __init__(self, dataset: Dataset, *, num_replicas: int, rank: int) -> None:
+        if num_replicas <= 0:
+            raise ValueError("num_replicas must be positive.")
+        if not 0 <= rank < num_replicas:
+            raise ValueError(f"rank {rank} must be in [0, {num_replicas}).")
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        return max(0, (remaining + self.num_replicas - 1) // self.num_replicas)
+
+
+def _distributed_info() -> Tuple[int, int, bool]:
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        return rank, world_size, world_size > 1
+    return 0, 1, False
+
+
+def _rank_zero_print(*values: object, **kwargs: Any) -> None:
+    rank, _, _ = _distributed_info()
+    if rank == 0:
+        print(*values, **kwargs)
+
+
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
 
 
 def sample_to_temporal_tensors(
@@ -142,8 +186,7 @@ def run_epoch(
 ) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
-    losses: List[float] = []
-    maes: List[float] = []
+    totals = torch.zeros(3, dtype=torch.float64, device=device)
     context = torch.enable_grad() if training else torch.no_grad()
 
     with context:
@@ -162,15 +205,20 @@ def run_epoch(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
-            losses.append(float(loss.detach().cpu()))
-            maes.append(float(mae.detach().cpu()))
+            value_count = mask.sum(dtype=torch.float64) * prediction.shape[-1]
+            totals[0] += loss.detach().to(torch.float64) * value_count
+            totals[1] += mae.detach().to(torch.float64) * value_count
+            totals[2] += value_count
 
-    if not losses:
-        raise RuntimeError("The DataLoader produced no batches.")
+    _, world_size, _ = _distributed_info()
+    if world_size > 1:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    if float(totals[2]) <= 0.0:
+        raise RuntimeError("The epoch processed no target values.")
 
     return {
-        "mse": sum(losses) / len(losses),
-        "mae": sum(maes) / len(maes),
+        "mse": float((totals[0] / totals[2]).cpu()),
+        "mae": float((totals[1] / totals[2]).cpu()),
     }
 
 
@@ -206,7 +254,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--train-fraction", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size per DDP process/GPU; global batch is batch_size * world_size.",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument(
         "--temporal-static-cache-size",
@@ -237,6 +290,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--mlp-ratio", type=int, default=2)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--local-rank",
+        "--local_rank",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -286,52 +346,71 @@ def _save_checkpoint(
     best_val: float,
     batch_generator: torch.Generator,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "model_config": model_config,
-            "args": vars(args),
-            "metrics": metrics,
-            "best_val": best_val,
-            "rng_state": {
-                "torch": torch.get_rng_state(),
-                "python": random.getstate(),
-                "batch_generator": batch_generator.get_state(),
-                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-            },
-            "feature_layout": {
-                "input": [
-                    "rho",
-                    "theta",
-                    "phi",
-                    *[
-                        (
-                            f"{field}_t"
-                            if frame == args.input_frames - 1
-                            else (
-                                f"{field}_t-"
-                                f"{(args.input_frames - frame - 1) * args.frame_stride}"
+    rank, world_size, distributed = _distributed_info()
+    model_device = next(_unwrap_model(model).parameters()).device
+    local_rng_state = {
+        "torch": torch.get_rng_state(),
+        "python": random.getstate(),
+        "batch_generator": batch_generator.get_state(),
+        "cuda_local": (
+            torch.cuda.get_rng_state(model_device)
+            if model_device.type == "cuda"
+            else None
+        ),
+    }
+    rng_states: List[Dict[str, Any]] = [local_rng_state]
+    if distributed:
+        gathered: List[Dict[str, Any] | None] = [None] * world_size
+        dist.all_gather_object(gathered, local_rng_state)
+        rng_states = [state for state in gathered if state is not None]
+
+    if rank == 0:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_model = _unwrap_model(model)
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": checkpoint_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "model_config": model_config,
+                "args": vars(args),
+                "metrics": metrics,
+                "best_val": best_val,
+                "world_size": world_size,
+                "rng_state": rng_states[0],
+                "rng_state_by_rank": rng_states,
+                "feature_layout": {
+                    "input": [
+                        "rho",
+                        "theta",
+                        "phi",
+                        *[
+                            (
+                                f"{field}_t"
+                                if frame == args.input_frames - 1
+                                else (
+                                    f"{field}_t-"
+                                    f"{(args.input_frames - frame - 1) * args.frame_stride}"
+                                )
                             )
-                        )
-                        for frame in range(args.input_frames)
-                        for field in ("prs_para", "prs_perp")
+                            for frame in range(args.input_frames)
+                            for field in ("prs_para", "prs_perp")
+                        ],
+                        "br",
+                        "bphi",
+                        "bz",
                     ],
-                    "br",
-                    "bphi",
-                    "bz",
-                ],
-                "output": [
-                    f"{field}_t+{(frame + 1) * args.frame_stride}"
+                    "output": [
+                        f"{field}_t+{(frame + 1) * args.frame_stride}"
                         for frame in range(args.output_frames)
                         for field in ("prs_para", "prs_perp")
-                ],
+                    ],
+                },
             },
-        },
-        path,
-    )
+            path,
+        )
+    if distributed:
+        dist.barrier()
 
 
 _RESUME_FIXED_ARGS = (
@@ -380,19 +459,33 @@ def _validate_resume_args(checkpoint: Dict[str, Any], args: argparse.Namespace) 
 def _restore_rng_state(
     checkpoint: Dict[str, Any],
     batch_generator: torch.Generator,
+    *,
+    rank: int,
+    device: torch.device,
 ) -> None:
-    state = checkpoint.get("rng_state")
+    states_by_rank = checkpoint.get("rng_state_by_rank")
+    state = None
+    if states_by_rank and rank < len(states_by_rank):
+        state = states_by_rank[rank]
+    if state is None:
+        state = checkpoint.get("rng_state")
     if not state:
-        print(
+        _rank_zero_print(
             "Resume checkpoint has no RNG state; continuing with a fresh RNG sequence."
         )
         return
     torch.set_rng_state(state["torch"])
     random.setstate(state["python"])
     batch_generator.set_state(state["batch_generator"])
-    cuda_state = state.get("cuda")
-    if cuda_state is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(cuda_state)
+    cuda_local = state.get("cuda_local")
+    if cuda_local is not None and device.type == "cuda":
+        torch.cuda.set_rng_state(cuda_local, device=device)
+    else:
+        # Backward compatibility with single-process checkpoints written before
+        # DDP support stored all visible CUDA generator states together.
+        cuda_state = state.get("cuda")
+        if cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_state)
 
 
 def main() -> None:
@@ -409,6 +502,34 @@ def main() -> None:
         raise ValueError("--epochs must be positive.")
     if args.max_nodes is not None and args.max_nodes <= 0:
         raise ValueError("--max-nodes must be positive when provided.")
+
+    requested_device = torch.device(args.device)
+    launch_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(
+        os.environ.get(
+            "LOCAL_RANK",
+            str(args.local_rank if args.local_rank is not None else 0),
+        )
+    )
+    if launch_world_size > 1 and requested_device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP requested CUDA processes, but CUDA is unavailable.")
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = requested_device
+        if device.type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA was requested, but CUDA is unavailable.")
+            device_index = (
+                device.index if device.index is not None else torch.cuda.current_device()
+            )
+            device = torch.device("cuda", device_index)
+            torch.cuda.set_device(device)
+    _ensure_distributed(device)
+    rank, world_size, data_parallel = _distributed_info()
+    patch_transolver_attention_for_cuda(data_parallel=data_parallel)
+    torch.manual_seed(args.seed + rank)
 
     resume_checkpoint: Dict[str, Any] | None = None
     resume_path: Path | None = None
@@ -427,26 +548,47 @@ def main() -> None:
                 f"({resume_epoch}) to perform a restart."
             )
 
-    torch.manual_seed(args.seed)
-    device = torch.device(args.device)
-    _ensure_distributed(device)
-    patch_transolver_attention_for_cuda()
-
-    folders = _discover_sample_folders(
-        args.results_root.expanduser(),
-        args.analysis_filename,
-        args.equilibrium_filename,
-        args.bfield_filename,
-    )
-    if args.max_samples is not None:
-        folders = folders[: args.max_samples]
+    folder_payload: List[List[Path] | None] = [None]
+    if rank == 0:
+        folders = _discover_sample_folders(
+            args.results_root.expanduser(),
+            args.analysis_filename,
+            args.equilibrium_filename,
+            args.bfield_filename,
+        )
+        if args.max_samples is not None:
+            folders = folders[: args.max_samples]
+        folder_payload[0] = folders
+    if data_parallel:
+        dist.broadcast_object_list(folder_payload, src=0)
+    folders = folder_payload[0]
+    if folders is None:
+        raise RuntimeError("Rank 0 did not provide the simulation folder list.")
     train_folders, val_folders = _split_folders(folders, args.train_fraction, args.seed)
     train_dataset = _build_window_dataset(train_folders, args)
     val_dataset = _build_window_dataset(val_folders, args) if val_folders else None
+    train_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=False,
+        )
+        if data_parallel
+        else None
+    )
+    val_sampler = (
+        DistributedEvalSampler(val_dataset, num_replicas=world_size, rank=rank)
+        if data_parallel and val_dataset is not None
+        else None
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=_identity_collate,
         persistent_workers=args.num_workers > 0,
@@ -457,6 +599,7 @@ def main() -> None:
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
+            sampler=val_sampler,
             num_workers=args.num_workers,
             collate_fn=_identity_collate,
             persistent_workers=args.num_workers > 0,
@@ -466,8 +609,8 @@ def main() -> None:
         else None
     )
 
-    batch_generator = torch.Generator().manual_seed(args.seed)
-    validation_generator = torch.Generator().manual_seed(args.seed + 1)
+    batch_generator = torch.Generator().manual_seed(args.seed + rank)
+    validation_generator = torch.Generator().manual_seed(args.seed + 1 + rank)
     validation_generator_state = validation_generator.get_state().clone()
     first_x, _, first_target = sample_to_temporal_tensors(
         train_dataset[0],
@@ -490,6 +633,11 @@ def main() -> None:
         "unified_pos": False,
     }
     model = TransolverPlusModel(**model_config).to(device)
+    # Temporal forecasting never supplies the optional three-value condition.
+    # Freeze its embedding so DDP does not wait for gradients that cannot exist.
+    if hasattr(model, "embedding"):
+        for parameter in model.embedding.parameters():
+            parameter.requires_grad_(False)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -512,9 +660,25 @@ def main() -> None:
         best_val = float(
             resume_checkpoint.get("best_val", metrics.get("val_mse", float("inf")))
         )
-        _restore_rng_state(resume_checkpoint, batch_generator)
+        _restore_rng_state(
+            resume_checkpoint,
+            batch_generator,
+            rank=rank,
+            device=device,
+        )
 
-    print(
+    if data_parallel:
+        ddp_kwargs: Dict[str, Any] = {"broadcast_buffers": False}
+        if device.type == "cuda":
+            ddp_kwargs.update(
+                {
+                    "device_ids": [device.index],
+                    "output_device": device.index,
+                }
+            )
+        model = DistributedDataParallel(model, **ddp_kwargs)
+
+    _rank_zero_print(
         f"Training on {len(train_folders)} simulations / {len(train_dataset)} windows"
         + (
             f"; validating on {len(val_folders)} simulations / {len(val_dataset)} windows"
@@ -523,8 +687,9 @@ def main() -> None:
         )
         + f"; input_frames={args.input_frames}, output_frames={args.output_frames}, "
         f"input_dim={input_dim}, output_dim={output_dim}, batch_size={args.batch_size}, "
+        f"global_batch_size={args.batch_size * world_size}, world_size={world_size}, "
         f"num_workers={args.num_workers}, static_cache_size={args.temporal_static_cache_size}, "
-        f"deterministic_validation=True, device={device}."
+        f"deterministic_validation=True, ddp={data_parallel}, device={device}."
     )
 
     if args.dry_run:
@@ -538,20 +703,33 @@ def main() -> None:
         model.eval()
         with torch.no_grad():
             prediction = predict_node_profiles(model, x, pos, mask)
-        print(
-            f"dry_run x={tuple(x.shape)} pos={tuple(pos.shape)} "
-            f"target={tuple(target.shape)} prediction={tuple(prediction.shape)}"
+        _rank_zero_print(
+            f"dry_run per_rank_x={tuple(x.shape)} pos={tuple(pos.shape)} "
+            f"target={tuple(target.shape)} prediction={tuple(prediction.shape)}, "
+            f"world_size={world_size}"
         )
+        _cleanup_distributed()
         return
 
-    args.save_dir.mkdir(parents=True, exist_ok=True)
-    with (args.save_dir / "config.json").open("w") as file:
-        json.dump(
-            {"args": vars(args), "model_config": model_config},
-            file,
-            indent=2,
-            default=str,
-        )
+    if rank == 0:
+        args.save_dir.mkdir(parents=True, exist_ok=True)
+        with (args.save_dir / "config.json").open("w") as file:
+            json.dump(
+                {
+                    "args": vars(args),
+                    "model_config": model_config,
+                    "distributed": {
+                        "world_size": world_size,
+                        "batch_size_per_rank": args.batch_size,
+                        "global_batch_size": args.batch_size * world_size,
+                    },
+                },
+                file,
+                indent=2,
+                default=str,
+            )
+    if data_parallel:
+        dist.barrier()
 
     if resume_checkpoint is not None and resume_path is not None:
         source_metrics_path = resume_path.parent / "metrics.jsonl"
@@ -563,9 +741,10 @@ def main() -> None:
                     row = json.loads(line)
                     if int(row["epoch"]) < start_epoch:
                         history.append(row)
-            with (args.save_dir / "metrics.jsonl").open("w") as file:
-                for row in history:
-                    file.write(json.dumps(row) + "\n")
+            if rank == 0:
+                with (args.save_dir / "metrics.jsonl").open("w") as file:
+                    for row in history:
+                        file.write(json.dumps(row) + "\n")
         if "best_val" not in resume_checkpoint:
             historical_values = [
                 float(row["val_mse"])
@@ -574,13 +753,16 @@ def main() -> None:
             ]
             if historical_values:
                 best_val = min(historical_values)
-        print(
+        _rank_zero_print(
             f"Resuming from {resume_path} at epoch {start_epoch}; "
             f"target epoch {args.epochs}; best_val={best_val:.6g}."
         )
 
     start = time.time()
     for epoch in range(start_epoch, args.epochs + 1):
+        epoch_start = time.time()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         train_metrics = run_epoch(
             model,
             train_loader,
@@ -622,14 +804,18 @@ def main() -> None:
                 )
 
         history.append(metrics)
-        with (args.save_dir / "metrics.jsonl").open("a") as file:
-            file.write(json.dumps(metrics) + "\n")
-        print(
-            " ".join(
-                f"{key}={value:.6g}" if isinstance(value, float) else f"{key}={value}"
-                for key, value in metrics.items()
+        if rank == 0:
+            with (args.save_dir / "metrics.jsonl").open("a") as file:
+                file.write(json.dumps(metrics) + "\n")
+            epoch_elapsed = time.time() - epoch_start
+            total_elapsed = time.time() - start
+            print(
+                " ".join(
+                    f"{key}={value:.6g}" if isinstance(value, float) else f"{key}={value}"
+                    for key, value in metrics.items()
+                )
+                + f" epoch_time={epoch_elapsed:.1f}s elapsed={total_elapsed:.1f}s"
             )
-        )
         if args.save_every > 0 and epoch % args.save_every == 0:
             _save_checkpoint(
                 args.save_dir / f"epoch_{epoch}.pt",
@@ -654,9 +840,10 @@ def main() -> None:
         best_val,
         batch_generator,
     )
-    print(
+    _rank_zero_print(
         f"Finished in {time.time() - start:.1f}s. Checkpoints written to {args.save_dir}"
     )
+    _cleanup_distributed()
 
 
 if __name__ == "__main__":

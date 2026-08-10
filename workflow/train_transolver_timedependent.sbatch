@@ -1,17 +1,19 @@
 #!/bin/bash
-# Stellar GPU job: one process on one A100.
+# Stellar single-node DDP job: one process per A100.
 # Change the account if `sshare` shows a different PPPL project for you.
 ##SBATCH --account=m5300
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
-#SBATCH --time=12:00:00
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=256G
+#SBATCH --time=24:00:00
 #SBATCH --job-name=transolver-time
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
+#SBATCH --mail-user=rchurchi@pppl.gov
+#SBATCH --mail-type=BEGIN,END,FAIL
 
 set -eo pipefail
 
@@ -30,10 +32,32 @@ else
   echo "Could not locate the alpha_analysis repository under ${SUBMIT_DIR}" >&2
   exit 1
 fi
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/../results/G1600}"
-SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/runs/transolver_alpha_timedependent/${SLURM_JOB_ID}}"
-ANACONDA_MODULE="${ANACONDA_MODULE:-anaconda3/2025.6}"
-ALPHA_ENV="${ALPHA_ENV:-torch-stellar}"
+
+# Routine experiment settings live in this file rather than being scattered
+# through the launch command below.
+TRAIN_CONFIG="${TRAIN_CONFIG:-${REPO_ROOT}/workflow/train_transolver_timedependent.conf}"
+if [[ ! -f "${TRAIN_CONFIG}" ]]; then
+  echo "Training config does not exist: ${TRAIN_CONFIG}" >&2
+  exit 1
+fi
+source "${TRAIN_CONFIG}"
+
+# torchrun starts one process per GPU allocated by Slurm.
+GPUS_PER_NODE="${SLURM_GPUS_ON_NODE:-1}"
+
+if (( GPUS_PER_NODE <= 0 )); then
+  echo "GPUS_PER_NODE must be positive: ${GPUS_PER_NODE}" >&2
+  exit 1
+fi
+if (( BATCH_SIZE_PER_GPU <= 0 )); then
+  echo "BATCH_SIZE_PER_GPU must be positive: ${BATCH_SIZE_PER_GPU}" >&2
+  exit 1
+fi
+if (( NUM_WORKERS_PER_GPU < 0 )); then
+  echo "NUM_WORKERS_PER_GPU must be nonnegative: ${NUM_WORKERS_PER_GPU}" >&2
+  exit 1
+fi
+
 if [[ ! -d "${RESULTS_ROOT}" ]]; then
   echo "Results directory does not exist: ${RESULTS_ROOT}" >&2
   exit 1
@@ -86,14 +110,24 @@ if torch.cuda.is_available():
 print(f"transolver_model {Model.__name__}")
 PY
 
-srun python -u -m alpha_analysis.ai.train_transolver_timedependent \
+echo "Training config: ${TRAIN_CONFIG}"
+echo "Results root: ${RESULTS_ROOT}"
+echo "Save directory: ${SAVE_DIR}"
+echo "Launching DDP with ${GPUS_PER_NODE} GPUs, batch_size_per_gpu=${BATCH_SIZE_PER_GPU}, global_batch_size=$((GPUS_PER_NODE * BATCH_SIZE_PER_GPU)), num_workers_per_gpu=${NUM_WORKERS_PER_GPU}"
+
+srun --ntasks=1 torchrun \
+  --standalone \
+  --nnodes=1 \
+  --nproc_per_node="${GPUS_PER_NODE}" \
+  -m alpha_analysis.ai.train_transolver_timedependent \
   --results-root "${RESULTS_ROOT}" \
   --save-dir "${SAVE_DIR}" \
   --device cuda \
-  --input-frames 1 \
-  --output-frames 1 \
-  --batch-size 4 \
-  --num-workers 4 \
-  --max-nodes 171462 \
-  --epochs 400 \
+  --input-frames "${INPUT_FRAMES}" \
+  --output-frames "${OUTPUT_FRAMES}" \
+  --batch-size "${BATCH_SIZE_PER_GPU}" \
+  --num-workers "${NUM_WORKERS_PER_GPU}" \
+  --max-nodes "${MAX_NODES}" \
+  --epochs "${EPOCHS}" \
+  "${EXTRA_TRAIN_ARGS[@]}" \
   "$@"

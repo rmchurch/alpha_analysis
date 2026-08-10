@@ -21,3 +21,20 @@ This repository is the starting point for the AI for Ascot5 (https://github.com/
   simulation before temporal windows are constructed. Checkpoints can be used
   for chunked autoregressive rollout with
   `workflow/predict_transolver_timedependent.py`.
+
+  Single-node multi-GPU training uses PyTorch DDP with one process per GPU:
+
+  ```bash
+  torchrun --standalone --nproc_per_node=2 \
+    -m alpha_analysis.ai.train_transolver_timedependent \
+    --results-root /path/to/G1600 \
+    --device cuda \
+    --batch-size 2
+  ```
+
+  `--batch-size` is per GPU, so the global batch size in this example is four.
+  For Slurm jobs, edit
+  `workflow/train_transolver_timedependent.conf` to set the batch size, worker
+  count, save directory, data path, frame counts, and other common training
+  options. Then submit `workflow/train_transolver_timedependent.sbatch`; the
+  wrapper automatically starts one process for every GPU in its Slurm request.
