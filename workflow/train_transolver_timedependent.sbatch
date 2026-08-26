@@ -115,6 +115,8 @@ echo "Results root: ${RESULTS_ROOT}"
 echo "Save directory: ${SAVE_DIR}"
 echo "Launching DDP with ${GPUS_PER_NODE} GPUs, batch_size_per_gpu=${BATCH_SIZE_PER_GPU}, global_batch_size=$((GPUS_PER_NODE * BATCH_SIZE_PER_GPU)), num_workers_per_gpu=${NUM_WORKERS_PER_GPU}"
 
+FOLDER_ARGS=(--train-folders "${TRAIN_FOLDERS}" --val-folders "${VAL_FOLDERS}")
+
 srun --ntasks=1 torchrun \
   --standalone \
   --nnodes=1 \
@@ -125,6 +127,7 @@ srun --ntasks=1 torchrun \
   --device cuda \
   --input-frames "${INPUT_FRAMES}" \
   --output-frames "${OUTPUT_FRAMES}" \
+  "${FOLDER_ARGS[@]}" \
   --batch-size "${BATCH_SIZE_PER_GPU}" \
   --num-workers "${NUM_WORKERS_PER_GPU}" \
   --max-nodes "${MAX_NODES}" \

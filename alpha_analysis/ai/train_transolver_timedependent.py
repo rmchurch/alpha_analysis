@@ -230,6 +230,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("/global/cfs/cdirs/m5300/results/G1600"),
     )
     parser.add_argument(
+        "--train-folders",
+        type=Path,
+        help="Explicit training folder manifest; must be paired with --val-folders.",
+    )
+    parser.add_argument(
+        "--val-folders",
+        type=Path,
+        help="Explicit validation folder manifest; must be paired with --train-folders.",
+    )
+    parser.add_argument(
         "--save-dir",
         type=Path,
         default=Path("runs/transolver_alpha_timedependent"),
@@ -311,6 +321,34 @@ def _split_folders(
         return shuffled, []
     split = max(1, min(len(shuffled) - 1, int(len(shuffled) * train_fraction)))
     return shuffled[:split], shuffled[split:]
+
+
+def _read_folder_manifest(path: Path, results_root: Path) -> List[Path]:
+    """Read a folder manifest, resolving paths against the active results root."""
+
+    folders: List[Path] = []
+    missing: List[str] = []
+    for line in path.expanduser().read_text().splitlines():
+        saved = line.strip()
+        if not saved or saved.startswith("#"):
+            continue
+        candidate = Path(saved).expanduser()
+        candidates = (candidate, results_root / candidate.name)
+        match = next((item.resolve() for item in candidates if item.is_dir()), None)
+        if match is None:
+            missing.append(saved)
+        else:
+            folders.append(match)
+    if missing:
+        raise FileNotFoundError(
+            f"Could not resolve {len(missing)} folders from {path}; first missing: {missing[0]}"
+        )
+    if not folders:
+        raise ValueError(f"Folder manifest is empty: {path}")
+    keys = [folder.name for folder in folders]
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"Folder manifest contains duplicate sample names: {path}")
+    return folders
 
 
 def _build_window_dataset(
@@ -490,6 +528,8 @@ def _restore_rng_state(
 
 def main() -> None:
     args = build_parser().parse_args()
+    if (args.train_folders is None) != (args.val_folders is None):
+        raise ValueError("--train-folders and --val-folders must be provided together.")
     if not (0.0 < args.train_fraction <= 1.0):
         raise ValueError("--train-fraction must be in (0, 1].")
     if args.batch_size <= 0:
@@ -550,21 +590,39 @@ def main() -> None:
 
     folder_payload: List[List[Path] | None] = [None]
     if rank == 0:
-        folders = _discover_sample_folders(
-            args.results_root.expanduser(),
-            args.analysis_filename,
-            args.equilibrium_filename,
-            args.bfield_filename,
-        )
-        if args.max_samples is not None:
-            folders = folders[: args.max_samples]
-        folder_payload[0] = folders
+        if args.train_folders is not None and args.val_folders is not None:
+            results_root = args.results_root.expanduser().resolve()
+            train_folders = _read_folder_manifest(args.train_folders, results_root)
+            val_folders = _read_folder_manifest(args.val_folders, results_root)
+            overlap = {folder.name for folder in train_folders} & {
+                folder.name for folder in val_folders
+            }
+            if overlap:
+                raise ValueError(
+                    "Training and validation manifests overlap; first duplicate: "
+                    f"{sorted(overlap)[0]}"
+                )
+            folder_payload[0] = train_folders + val_folders
+        else:
+            folders = _discover_sample_folders(
+                args.results_root.expanduser(),
+                args.analysis_filename,
+                args.equilibrium_filename,
+                args.bfield_filename,
+            )
+            if args.max_samples is not None:
+                folders = folders[: args.max_samples]
+            folder_payload[0] = folders
     if data_parallel:
         dist.broadcast_object_list(folder_payload, src=0)
     folders = folder_payload[0]
     if folders is None:
         raise RuntimeError("Rank 0 did not provide the simulation folder list.")
-    train_folders, val_folders = _split_folders(folders, args.train_fraction, args.seed)
+    if args.train_folders is not None and args.val_folders is not None:
+        train_folders = _read_folder_manifest(args.train_folders, args.results_root)
+        val_folders = _read_folder_manifest(args.val_folders, args.results_root)
+    else:
+        train_folders, val_folders = _split_folders(folders, args.train_fraction, args.seed)
     train_dataset = _build_window_dataset(train_folders, args)
     val_dataset = _build_window_dataset(val_folders, args) if val_folders else None
     train_sampler = (

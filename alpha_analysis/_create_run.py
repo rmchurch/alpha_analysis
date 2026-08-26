@@ -166,6 +166,7 @@ class RunItem:
                     fraction_T = kwargs.get('fraction_T', 0.5)
                     nrho = kwargs.get('nrho', 1024)
                     Zeff = kwargs.get('Zeff', 1.0)
+                    include_wall = kwargs.get('include_wall', True)
                     
                     logger.info(f" >> Creating new ASCOT input from DESC file {equ}")
                     logger.info(f"    - nR = {nR}, nZ = {nZ}, nPhi = {nPhi}")
@@ -179,7 +180,8 @@ class RunItem:
                                          M_poloidal=M_poloidal,
                                          use_stell_sym=stellsym)
                     a5src.data.create_input('desc profiles', fn=equ, fraction_T=fraction_T, nrho=nrho, Zeff=Zeff)
-                    a5src.data.create_input("import_desc_lcfs_as_wall", fn=equ)
+                    if include_wall:
+                        a5src.data.create_input("import_desc_lcfs_as_wall", fn=equ)
         
         # We now create the ASCOT input.
         if create:
