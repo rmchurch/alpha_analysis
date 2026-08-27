@@ -2,11 +2,11 @@
 #SBATCH --account=pppl
 #SBATCH --partition=pppl
 #SBATCH --qos=pppl-short-stellar
-#SBATCH --nodes=8
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=24
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=700G
-#SBATCH --time=08:00:00
+#SBATCH --time=01:00:00
 #SBATCH --job-name=afsi-initial-mpi
 #SBATCH --output=workflow/logs/afsi_initial_mpi_%j.out
 #SBATCH --error=workflow/logs/afsi_initial_mpi_%j.err
@@ -51,6 +51,7 @@ PY
 srun --mpi=pmix_v3 --cpu-bind=cores --kill-on-bad-exit=1 \
     python -u workflow/export_afsi_initial_pressure.py \
     --mpi \
+    --replace-incompatible \
     --results-root "${RESULTS_ROOT}" \
     --nrho-bins 100 \
     --nenergy-bins 49 \

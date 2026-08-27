@@ -15,12 +15,12 @@ from alpha_analysis.ai.time_dependent import (
     append_predicted_frames,
 )
 from alpha_analysis.ai.train_transolver import (
-    TransolverPlusModel,
     _cleanup_distributed,
     _ensure_distributed,
     patch_transolver_attention_for_cuda,
 )
 from alpha_analysis.ai.train_transolver_timedependent import (
+    AFSIContextTransolverModel,
     predict_node_profiles,
     sample_to_temporal_tensors,
 )
@@ -31,7 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--checkpoint", default="best.pt")
     parser.add_argument("--sample-folder", type=Path, required=True)
-    parser.add_argument("--seed-start", type=int, default=0)
+    parser.add_argument(
+        "--seed-start",
+        type=int,
+        default=0,
+        help="Stored ASCOT frame index at which the autoregressive seed begins.",
+    )
     parser.add_argument(
         "--forecast-frames",
         type=int,
@@ -87,13 +92,21 @@ def main() -> None:
     input_frames = int(saved_args["input_frames"])
     output_frames = int(saved_args["output_frames"])
     frame_stride = int(saved_args["frame_stride"])
+    afsi_filename = saved_args.get("afsi_filename")
+    if afsi_filename is None:
+        raise ValueError(
+            "This checkpoint predates AFSI initial conditioning; train a new temporal "
+            "checkpoint with the updated trainer."
+        )
 
     dataset = Ascot5Dataset(
         [args.sample_folder],
         analysis_filename=saved_args["analysis_filename"],
         equilibrium_filename=saved_args["equilibrium_filename"],
         bfield_filename=saved_args["bfield_filename"],
+        afsi_filename=afsi_filename,
         include_bfield=True,
+        include_afsi=True,
         include_target=False,
         strict=True,
     )
@@ -120,7 +133,7 @@ def main() -> None:
     checkpoint_path = _checkpoint_path(args.run_dir, args.checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model_config = checkpoint.get("model_config", config["model_config"])
-    model = TransolverPlusModel(**model_config).to(device)
+    model = AFSIContextTransolverModel(**model_config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
@@ -138,11 +151,12 @@ def main() -> None:
             repeat_shape = (output_frames,) + (1,) * (history_para.ndim - 1)
             model_sample["target_prs_para"] = history_para[-1:].repeat(repeat_shape)
             model_sample["target_prs_perp"] = history_perp[-1:].repeat(repeat_shape)
-            x, pos, _ = sample_to_temporal_tensors(
+            x, pos, _, source_context, source_strength = sample_to_temporal_tensors(
                 model_sample,
                 max_nodes=None,
                 profile_log1p=not bool(saved_args["no_profile_log1p"]),
                 generator=generator,
+                context_points=int(saved_args.get("context_points", 100)),
             )
             mask = torch.ones((1, x.shape[0]), dtype=torch.bool, device=device)
             prediction = predict_node_profiles(
@@ -150,6 +164,8 @@ def main() -> None:
                 x.unsqueeze(0).to(device),
                 pos.unsqueeze(0).to(device),
                 mask,
+                source_context.unsqueeze(0).to(device),
+                source_strength.unsqueeze(0).to(device),
             )[0].cpu()
             history_para, history_perp = append_predicted_frames(
                 history_para,
@@ -181,6 +197,8 @@ def main() -> None:
             "checkpoint": str(checkpoint_path),
             "seed_indices": seed_indices,
             "seed_times": sample["profile_time"].index_select(0, seed_indices),
+            "afsi_context": "pitch_averaged_radial_source",
+            "afsi_filename": afsi_filename,
             "prediction_times": prediction_times,
             "predicted_prs_para": predicted_para,
             "predicted_prs_perp": predicted_perp,

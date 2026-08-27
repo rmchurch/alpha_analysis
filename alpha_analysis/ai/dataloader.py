@@ -4,6 +4,7 @@ Each sample folder is expected to contain:
     - ``desc_equilibrium.h5``
     - ``analysis_results.h5``
     - optionally ``bfield.h5``
+    - optionally ``afsi_initial.h5``
 
 The dataset reads:
     - ``desc_equilibrium.h5``: ``_R_lmn`` and ``_Z_lmn``
@@ -34,6 +35,7 @@ PathLike = Union[str, Path]
 DEFAULT_ANALYSIS_FILENAME = "analysis_results.h5"
 DEFAULT_EQUILIBRIUM_FILENAME = "desc_equilibrium.h5"
 DEFAULT_BFIELD_FILENAME = "bfield.h5"
+DEFAULT_AFSI_FILENAME = "afsi_initial.h5"
 BFIELD_DATASETS = ("br", "bphi", "bz")
 BFIELD_COORDINATE_DATASETS = ("rho", "theta", "phi")
 PROFILE_TIME_DATASET = "profiles/time"
@@ -54,6 +56,7 @@ class SamplePaths:
     analysis_path: Path
     equilibrium_path: Path
     bfield_path: Union[Path, None]
+    afsi_path: Union[Path, None]
 
 
 def _resolve_sample_paths(
@@ -61,7 +64,9 @@ def _resolve_sample_paths(
     analysis_filename: str,
     equilibrium_filename: str,
     bfield_filename: str,
+    afsi_filename: str,
     include_bfield: bool,
+    include_afsi: bool,
     strict: bool,
 ) -> Tuple[List[SamplePaths], List[str]]:
     samples: List[SamplePaths] = []
@@ -81,11 +86,14 @@ def _resolve_sample_paths(
         analysis_path = folder_path / analysis_filename
         equilibrium_path = folder_path / equilibrium_filename
         bfield_path = folder_path / bfield_filename
+        afsi_path = folder_path / afsi_filename
 
         try:
             required_paths = [analysis_path, equilibrium_path]
             if include_bfield:
                 required_paths.append(bfield_path)
+            if include_afsi:
+                required_paths.append(afsi_path)
             missing_files = [
                 str(path.name)
                 for path in required_paths
@@ -95,6 +103,8 @@ def _resolve_sample_paths(
             required_names = [analysis_filename, equilibrium_filename]
             if include_bfield:
                 required_names.append(bfield_filename)
+            if include_afsi:
+                required_names.append(afsi_filename)
             message = "{}: cannot access required files ({})".format(
                 folder_path, ", ".join(required_names)
             )
@@ -115,6 +125,7 @@ def _resolve_sample_paths(
                 analysis_path=analysis_path,
                 equilibrium_path=equilibrium_path,
                 bfield_path=bfield_path if include_bfield else None,
+                afsi_path=afsi_path if include_afsi else None,
             )
         )
 
@@ -222,6 +233,68 @@ def _read_bfield_file(bfield_path: Path) -> Dict[str, Tensor]:
     return bfield
 
 
+def _read_afsi_file(afsi_path: Path) -> Dict[str, Tensor]:
+    """Read the pitch-averaged differential source as ``S(rho, ekin, 1)``."""
+
+    with h5py.File(afsi_path, "r") as afsi_file:
+        dataset_name = "afsi_distribution/distribution_function"
+        source = _read_required_dataset(afsi_file, dataset_name)
+        dimensions_raw = afsi_file[dataset_name].attrs.get("dimensions")
+        if dimensions_raw is None:
+            raise KeyError(f"Missing 'dimensions' metadata on {dataset_name} in {afsi_path}")
+        if isinstance(dimensions_raw, bytes):
+            dimensions_raw = dimensions_raw.decode()
+        dimensions = list(json.loads(str(dimensions_raw)))
+        if len(dimensions) != source.ndim:
+            raise ValueError(
+                f"AFSI dimensions metadata {dimensions} does not match source shape "
+                f"{tuple(source.shape)} in {afsi_path}."
+            )
+        retained = ("rho", "ekin", "xi")
+        missing = [name for name in retained if name not in dimensions]
+        if missing:
+            raise ValueError(f"AFSI source in {afsi_path} is missing axes: {missing}")
+        for axis in reversed(range(len(dimensions))):
+            if dimensions[axis] in retained:
+                continue
+            if source.shape[axis] != 1:
+                raise ValueError(
+                    f"Cannot reduce non-singleton AFSI axis {dimensions[axis]!r} with "
+                    f"size {source.shape[axis]} in {afsi_path}."
+                )
+            source = source.select(axis, 0)
+            dimensions.pop(axis)
+        source = source.permute(*(dimensions.index(name) for name in retained))
+        source = source.mean(dim=2, keepdim=True).contiguous()
+        afsi = {"source": source}
+        for name in retained:
+            coordinate_name = f"afsi_distribution/coordinates/{name}"
+            afsi[name] = _read_required_dataset(afsi_file, coordinate_name)
+        afsi["ekin_edges"] = _read_required_dataset(
+            afsi_file, "afsi_distribution/coordinates/ekin_edges"
+        )
+        afsi["rho_edges"] = _read_required_dataset(
+            afsi_file, "afsi_distribution/coordinates/rho_edges"
+        )
+        afsi["xi"] = afsi["xi"].mean().reshape(1)
+    if source.shape[0] != afsi["rho"].numel() or source.shape[1] != afsi["ekin"].numel():
+        raise ValueError(
+            f"AFSI source shape {tuple(source.shape)} does not match its rho/ekin "
+            f"coordinates in {afsi_path}."
+        )
+    if afsi["ekin_edges"].numel() != source.shape[1] + 1:
+        raise ValueError(
+            f"AFSI energy edges in {afsi_path} do not bracket its {source.shape[1]} "
+            "energy bins."
+        )
+    if afsi["rho_edges"].numel() != source.shape[0] + 1:
+        raise ValueError(
+            f"AFSI rho edges in {afsi_path} do not bracket its {source.shape[0]} "
+            "radial bins."
+        )
+    return afsi
+
+
 def _pad_tensor_batch(
     tensors: Sequence[Tensor],
     pad_value: float = 0.0,
@@ -273,8 +346,10 @@ class Ascot5Dataset(Dataset):
         analysis_filename: str = DEFAULT_ANALYSIS_FILENAME,
         equilibrium_filename: str = DEFAULT_EQUILIBRIUM_FILENAME,
         bfield_filename: str = DEFAULT_BFIELD_FILENAME,
+        afsi_filename: str = DEFAULT_AFSI_FILENAME,
         ascot_filename: Union[str, None] = None,
         include_bfield: bool = False,
+        include_afsi: bool = False,
         strict: bool = True,
         target_database_path: Union[PathLike, None] = None,
         target_database_key: str = DEFAULT_TARGET_DATABASE_KEY,
@@ -284,12 +359,15 @@ class Ascot5Dataset(Dataset):
     ) -> None:
         del ascot_filename
         self.include_bfield = include_bfield
+        self.include_afsi = include_afsi
         self.samples, self.skipped_folders = _resolve_sample_paths(
             folders=folders,
             analysis_filename=analysis_filename,
             equilibrium_filename=equilibrium_filename,
             bfield_filename=bfield_filename,
+            afsi_filename=afsi_filename,
             include_bfield=include_bfield,
+            include_afsi=include_afsi,
             strict=strict,
         )
         self.target_database: Union[Dict[str, float], None] = None
@@ -342,6 +420,10 @@ class Ascot5Dataset(Dataset):
             if sample_paths.bfield_path is None:
                 raise ValueError(f"No bfield file is configured for {sample_paths.folder}")
             sample["bfield"] = _read_bfield_file(sample_paths.bfield_path)
+        if self.include_afsi:
+            if sample_paths.afsi_path is None:
+                raise ValueError(f"No AFSI file is configured for {sample_paths.folder}")
+            sample["afsi"] = _read_afsi_file(sample_paths.afsi_path)
 
         if self.temporal_static_cache_size > 0:
             self._temporal_static_cache[index] = sample
@@ -447,6 +529,10 @@ class Ascot5Dataset(Dataset):
             if sample_paths.bfield_path is None:
                 raise ValueError(f"No bfield file is configured for {sample_paths.folder}")
             sample["bfield"] = _read_bfield_file(sample_paths.bfield_path)
+        if self.include_afsi:
+            if sample_paths.afsi_path is None:
+                raise ValueError(f"No AFSI file is configured for {sample_paths.folder}")
+            sample["afsi"] = _read_afsi_file(sample_paths.afsi_path)
         return sample
 
 
@@ -572,6 +658,7 @@ __all__ = [
     "BFIELD_COORDINATE_DATASETS",
     "BFIELD_DATASETS",
     "DEFAULT_ANALYSIS_FILENAME",
+    "DEFAULT_AFSI_FILENAME",
     "DEFAULT_ASCOT_FILENAME",
     "DEFAULT_BFIELD_FILENAME",
     "DEFAULT_EQUILIBRIUM_FILENAME",

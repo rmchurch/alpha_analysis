@@ -69,6 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output filename written beside each equilibrium.",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--replace-incompatible",
+        action="store_true",
+        help=(
+            "Replace an existing output when its stored AFSI/grid configuration "
+            "does not match the current request; otherwise skip it."
+        ),
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -172,7 +180,11 @@ def discover_equilibria(args: argparse.Namespace) -> list[Path]:
         raise FileNotFoundError(f"Results root does not exist: {root}")
 
     equilibria = sorted(root.rglob(args.equilibrium_filename))
-    equilibria = [path for path in equilibria if path.is_file()]
+    equilibria = [
+        path
+        for path in equilibria
+        if path.is_file() and path.parent.name != "initial_pressure"
+    ]
     shard_index, num_shards = _resolve_sharding(args)
     if shard_index is not None and num_shards is not None:
         equilibria = [
@@ -549,11 +561,45 @@ def write_output(
             tmp_path.unlink()
 
 
+_OUTPUT_CONFIGURATION_KEYS = (
+    "nrho_bins",
+    "nenergy_bins",
+    "npitch_bins",
+    "nmc",
+    "nthermal_vel",
+    "field_nr",
+    "field_nz",
+    "field_nphi",
+    "profile_nrho",
+    "fraction_tritium",
+    "zeff",
+    "l_radial",
+    "m_poloidal",
+    "no_stellarator_symmetry",
+    "accumulation_time_s",
+)
+
+
+def _output_configuration_matches(
+    output_path: Path, args: argparse.Namespace
+) -> bool:
+    try:
+        with h5py.File(output_path, "r") as h5f:
+            stored = json.loads(str(h5f.attrs["configuration"]))
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    requested = vars(args)
+    return all(stored.get(key) == requested.get(key) for key in _OUTPUT_CONFIGURATION_KEYS)
+
+
 def process_equilibrium(equilibrium_path: Path, args: argparse.Namespace) -> dict[str, str]:
     folder = equilibrium_path.parent
     output_path = folder / args.output_filename
     if output_path.exists() and not args.overwrite:
-        return {"status": "skipped", "path": str(output_path), "message": "output exists"}
+        compatible = _output_configuration_matches(output_path, args)
+        if not args.replace_incompatible or compatible:
+            message = "compatible output exists" if compatible else "output exists"
+            return {"status": "skipped", "path": str(output_path), "message": message}
 
     analysis_candidate = folder / args.analysis_filename
     analysis_path = analysis_candidate if analysis_candidate.is_file() else None

@@ -21,6 +21,12 @@ class _SimulationDataset(Dataset):
             "prs_para": values,
             "prs_perp": values + 100,
             "profile_time": torch.arange(5, dtype=torch.float32) * 0.25,
+            "afsi": {
+                "source": torch.arange(6, dtype=torch.float32).reshape(2, 3, 1),
+                "rho": torch.tensor([0.25, 0.75]),
+                "ekin": torch.arange(3, dtype=torch.float32),
+                "xi": torch.tensor([0.0]),
+            },
         }
 
     def __len__(self):
@@ -40,11 +46,13 @@ def test_temporal_windows_support_multi_input_and_output():
         window_stride=1,
     )
     assert len(dataset) == 2
+    first = dataset[0]
+    assert first["input_indices"].tolist() == [0, 1]
+    assert first["target_indices"].tolist() == [2, 3]
     second = dataset[1]
     assert second["input_indices"].tolist() == [1, 2]
     assert second["target_indices"].tolist() == [3, 4]
     assert second["input_times"].tolist() == [0.25, 0.5]
-
 
 def test_ascot_temporal_windows_read_only_selected_frames_and_cache_static_data(
     tmp_path, monkeypatch
@@ -62,6 +70,17 @@ def test_ascot_temporal_windows_read_only_selected_frames_and_cache_static_data(
     with h5py.File(folder / "bfield.h5", "w") as bfield_file:
         for offset, name in enumerate(("br", "bphi", "bz")):
             bfield_file.create_dataset(name, data=np.full((2, 3), offset + 1.0))
+    with h5py.File(folder / "afsi_initial.h5", "w") as afsi_file:
+        distribution = afsi_file.create_group("afsi_distribution")
+        values = np.arange(1 * 2 * 1 * 3 * 2 * 1 * 1).reshape(1, 2, 1, 3, 2, 1, 1)
+        source = distribution.create_dataset("distribution_function", data=values)
+        source.attrs["dimensions"] = '["phi", "rho", "theta", "ekin", "xi", "time", "charge"]'
+        coordinates = distribution.create_group("coordinates")
+        coordinates.create_dataset("rho", data=[0.25, 0.75])
+        coordinates.create_dataset("rho_edges", data=[0.0, 0.5, 1.0])
+        coordinates.create_dataset("ekin", data=[1.0, 2.0, 3.0])
+        coordinates.create_dataset("ekin_edges", data=[0.5, 1.5, 2.5, 3.5])
+        coordinates.create_dataset("xi", data=[-0.5, 0.5])
 
     bfield_reads = []
     original_read_bfield = dataloader_module._read_bfield_file
@@ -74,6 +93,7 @@ def test_ascot_temporal_windows_read_only_selected_frames_and_cache_static_data(
     simulations = Ascot5Dataset(
         [folder],
         include_bfield=True,
+        include_afsi=True,
         include_target=False,
         temporal_static_cache_size=2,
     )
@@ -96,6 +116,14 @@ def test_ascot_temporal_windows_read_only_selected_frames_and_cache_static_data(
     assert "context" not in second
     assert len(bfield_reads) == 1
     assert first["bfield"] is second["bfield"]
+    assert first["afsi"] is second["afsi"]
+
+    assert first["input_indices"].tolist() == [0, 1]
+    assert first["afsi"]["source"].shape == (2, 3, 1)
+    torch.testing.assert_close(
+        first["afsi"]["source"],
+        torch.tensor([[[0.5], [2.5], [4.5]], [[6.5], [8.5], [10.5]]]),
+    )
 
     complete_sample = simulations[0]
     assert complete_sample["prs_para"].shape == (5, 2, 3)

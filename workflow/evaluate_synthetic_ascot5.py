@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Evaluate scalar fast-ion-loss inference on synthetic ASCOT5 trajectories.
 
-The temporal Transolver is seeded with the first stored pressure frame and
-autoregressively generates the remaining frames.  The complete synthetic
-trajectory is then passed through the scalar Transolver.  Its scalar output and
+The temporal Transolver is conditioned on pitch-averaged ``S(rho, ekin)`` from
+the AFSI birth distribution, seeded with the initial ASCOT pressure frame, and
+autoregressively generates the later frames. The complete synthetic trajectory is then passed through the scalar
+Transolver. Its scalar output and
 its captured latent tokens are evaluated against the ASCOT5 fraction lost.
 """
 
@@ -48,6 +49,7 @@ from alpha_analysis.ai.train_transolver import (
     patch_transolver_attention_for_cuda,
 )
 from alpha_analysis.ai.train_transolver_timedependent import (
+    AFSIContextTransolverModel,
     predict_node_profiles,
     sample_to_temporal_tensors,
 )
@@ -136,7 +138,12 @@ def _load_transolver(
     checkpoint_path = _checkpoint_path(run_dir, checkpoint_name)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model_config = checkpoint.get("model_config", config["model_config"])
-    model = TransolverPlusModel(**model_config).to(device)
+    model_class = (
+        AFSIContextTransolverModel
+        if "context_points" in model_config
+        else TransolverPlusModel
+    )
+    model = model_class(**model_config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, config, checkpoint_path
@@ -204,6 +211,8 @@ def rollout_synthetic_profiles(
             f"{sample['folder']} has fewer than {input_frames} temporal seed frames."
         )
 
+    if "afsi" not in sample:
+        raise KeyError("AFSI-conditioned rollout sample is missing the AFSI distribution.")
     history_para = sample["prs_para"][:input_frames].clone()
     history_perp = sample["prs_perp"][:input_frames].clone()
     grid_shape = tuple(sample["bfield"]["br"].shape)
@@ -218,11 +227,12 @@ def rollout_synthetic_profiles(
             repeat_shape = (output_frames,) + (1,) * (history_para.ndim - 1)
             model_sample["target_prs_para"] = history_para[-1:].repeat(repeat_shape)
             model_sample["target_prs_perp"] = history_perp[-1:].repeat(repeat_shape)
-            x, pos, _ = sample_to_temporal_tensors(
+            x, pos, _, source_context, source_strength = sample_to_temporal_tensors(
                 model_sample,
                 max_nodes=None,
                 profile_log1p=not bool(saved_args["no_profile_log1p"]),
                 generator=generator,
+                context_points=int(saved_args.get("context_points", 100)),
             )
             mask = torch.ones((1, x.shape[0]), dtype=torch.bool, device=device)
             prediction = predict_node_profiles(
@@ -230,6 +240,8 @@ def rollout_synthetic_profiles(
                 x.unsqueeze(0).to(device),
                 pos.unsqueeze(0).to(device),
                 mask,
+                source_context.unsqueeze(0).to(device),
+                source_strength.unsqueeze(0).to(device),
             )[0].cpu()
             history_para, history_perp = append_predicted_frames(
                 history_para,
@@ -479,6 +491,7 @@ def main() -> None:
     temporal_model, temporal_config, temporal_checkpoint = _load_transolver(
         temporal_run_dir, args.temporal_checkpoint, device
     )
+    temporal_saved_args = temporal_config["args"]
     static_model, loaded_static_config, static_checkpoint = _load_transolver(
         static_run_dir, args.static_checkpoint, device
     )
@@ -493,7 +506,9 @@ def main() -> None:
         analysis_filename=static_saved_args["analysis_filename"],
         equilibrium_filename=static_saved_args["equilibrium_filename"],
         bfield_filename=static_saved_args["bfield_filename"],
+        afsi_filename=temporal_saved_args["afsi_filename"],
         include_bfield=True,
+        include_afsi=True,
         strict=True,
         target_database_path=target_database,
         target_database_key=static_saved_args["target_database_key"],

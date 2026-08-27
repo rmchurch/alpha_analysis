@@ -2,9 +2,10 @@
 """Plot autoregressive Transolver rollouts on ASCOT5 validation simulations.
 
 The timedependent Transolver run in this repository is trained to predict one
-frame from the preceding frame.  This script feeds the prediction back into
-the model repeatedly, starting from frame zero, and compares frame ``t=10``
-with the corresponding ground truth.  Each selected validation simulation is
+frame from the preceding state. This script feeds the prediction back into
+the model repeatedly, starting from ASCOT frame zero while supplying fixed AFSI
+cross-attention context, and compares frame ``t=10`` with the corresponding
+ground truth. Each selected validation simulation is
 shown as two rows (parallel and perpendicular pressure) and three columns:
 initial frame, predicted final frame, and ground-truth final frame.
 """
@@ -31,12 +32,12 @@ from alpha_analysis.ai.train_transolver import (
     patch_transolver_attention_for_cuda,
 )
 from alpha_analysis.ai.train_transolver_timedependent import (
+    AFSIContextTransolverModel,
     _split_folders,
     predict_node_profiles,
     sample_to_temporal_tensors,
 )
 from alpha_analysis.ai.time_dependent import append_predicted_frames
-from alpha_analysis.ai.train_transolver import TransolverPlusModel
 
 
 PROFILE_NAMES = ("prs_para", "prs_perp")
@@ -182,6 +183,8 @@ def _rollout(
         )
 
     grid_shape = tuple(int(size) for size in sample["bfield"]["br"].shape)
+    if "afsi" not in sample:
+        raise KeyError("AFSI-conditioned rollout sample is missing the AFSI distribution.")
     history_para = sample["prs_para"][:input_frames].clone()
     history_perp = sample["prs_perp"][:input_frames].clone()
     generator = torch.Generator().manual_seed(int(saved_args["seed"]))
@@ -193,11 +196,12 @@ def _rollout(
             model_sample["input_prs_perp"] = history_perp[-input_frames:]
             model_sample["target_prs_para"] = history_para[-1:].clone()
             model_sample["target_prs_perp"] = history_perp[-1:].clone()
-            x, pos, _ = sample_to_temporal_tensors(
+            x, pos, _, source_context, source_strength = sample_to_temporal_tensors(
                 model_sample,
                 max_nodes=None,
                 profile_log1p=not bool(saved_args["no_profile_log1p"]),
                 generator=generator,
+                context_points=int(saved_args.get("context_points", 100)),
             )
             mask = torch.ones((1, x.shape[0]), dtype=torch.bool, device=device)
             prediction = predict_node_profiles(
@@ -205,6 +209,8 @@ def _rollout(
                 x.unsqueeze(0).to(device),
                 pos.unsqueeze(0).to(device),
                 mask,
+                source_context.unsqueeze(0).to(device),
+                source_strength.unsqueeze(0).to(device),
             )[0].cpu()
             history_para, history_perp = append_predicted_frames(
                 history_para,
@@ -299,7 +305,7 @@ def _plot_examples(
         },
     )
     column_titles = (
-        "Initial frame (t=1)",
+        "Initial ASCOT frame (t=1)",
         f"Predicted final (t={total_frames})",
         f"Ground truth (t={total_frames})",
         "Prediction − ground truth",
@@ -477,7 +483,7 @@ def _plot_rho_examples(
     )
     state_colors = ("#2563eb", "#ea580c", "#16a34a")
     column_titles = (
-        "Initial frame (t=1)",
+        "Initial ASCOT frame (t=1)",
         f"Predicted final (t={total_frames})",
         f"Ground truth (t={total_frames})",
         "Prediction − ground truth",
@@ -561,6 +567,11 @@ def main() -> None:
         saved_args["equilibrium_filename"],
         saved_args["bfield_filename"],
     )
+    folders = [
+        folder
+        for folder in folders
+        if (folder / saved_args["afsi_filename"]).is_file()
+    ]
     if saved_args.get("max_samples") is not None:
         folders = folders[: int(saved_args["max_samples"])]
     _, val_folders = _split_folders(folders, float(saved_args["train_fraction"]), int(saved_args["seed"]))
@@ -571,7 +582,9 @@ def main() -> None:
         analysis_filename=saved_args["analysis_filename"],
         equilibrium_filename=saved_args["equilibrium_filename"],
         bfield_filename=saved_args["bfield_filename"],
+        afsi_filename=saved_args["afsi_filename"],
         include_bfield=True,
+        include_afsi=True,
         include_target=False,
         strict=True,
     )
@@ -583,7 +596,9 @@ def main() -> None:
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Missing checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    model = TransolverPlusModel(**checkpoint.get("model_config", config["model_config"])).to(device)
+    model = AFSIContextTransolverModel(
+        **checkpoint.get("model_config", config["model_config"])
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 

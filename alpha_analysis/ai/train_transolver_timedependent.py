@@ -13,11 +13,13 @@ from typing import Any, Dict, Iterator, List, Sequence, Tuple
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 
 from .dataloader import (
     DEFAULT_ANALYSIS_FILENAME,
+    DEFAULT_AFSI_FILENAME,
     DEFAULT_BFIELD_FILENAME,
     DEFAULT_EQUILIBRIUM_FILENAME,
     Ascot5Dataset,
@@ -76,13 +78,75 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
+class AFSIContextTransolverModel(TransolverPlusModel):
+    """Transolver++ with AFSI cross-attention in every slice-token block."""
+
+    def __init__(
+        self,
+        *,
+        context_hidden_dim: int = 64,
+        context_points: int = 100,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        if context_points <= 0:
+            raise ValueError("context_points must be positive.")
+        self.context_points = context_points
+        self.source_encoder = nn.Sequential(
+            nn.Linear(2, context_hidden_dim),
+            nn.GELU(),
+            nn.Linear(context_hidden_dim, self.n_hidden),
+        )
+        self.source_strength_embedding = nn.Linear(1, self.n_hidden)
+        for block in self.blocks:
+            attention = block.Attn
+            attention.context_cross_attention = nn.MultiheadAttention(
+                self.n_hidden,
+                attention.heads,
+                dropout=attention.dropout.p,
+                batch_first=True,
+            )
+            attention.context_cross_norm = nn.LayerNorm(self.n_hidden)
+        self.source_encoder.apply(self._init_weights)
+        self.source_strength_embedding.apply(self._init_weights)
+        for block in self.blocks:
+            block.Attn.context_cross_attention.apply(self._init_weights)
+            block.Attn.context_cross_norm.apply(self._init_weights)
+
+    def forward(self, data: Tuple[Tensor, Tensor, Tensor, Tensor]) -> Tensor:
+        x, pos, source_context, source_strength = data
+        if self.unified_pos:
+            x = torch.cat((x, self.get_grid(pos)), dim=-1)
+        context_tokens = self.source_encoder(source_context)
+        context_tokens = context_tokens + self.source_strength_embedding(
+            source_strength.reshape(source_strength.shape[0], 1, 1)
+        )
+        attentions = [block.Attn for block in self.blocks]
+        for attention in attentions:
+            attention._context_tokens = context_tokens
+        try:
+            fx = self.preprocess(x) + self.placeholder[None, None, :]
+            for block in self.blocks:
+                # The context tokens are explicit parts of the autograd graph, so
+                # these blocks intentionally avoid the upstream reentrant wrapper.
+                fx = block.Attn(block.ln_1(fx)) + fx
+                fx = block.mlp(block.ln_2(fx)) + fx
+                if block.last_layer:
+                    fx = block.mlp2(block.ln_3(fx))
+            return fx
+        finally:
+            for attention in attentions:
+                attention._context_tokens = None
+
+
 def sample_to_temporal_tensors(
     sample: Dict[str, Any],
     *,
     max_nodes: int | None,
     profile_log1p: bool,
     generator: torch.Generator,
-) -> Tuple[Tensor, Tensor, Tensor]:
+    context_points: int = 100,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Build node inputs, positions, and future profile targets for one window."""
 
     grid_shape = tuple(sample["bfield"]["br"].shape)
@@ -116,7 +180,59 @@ def sample_to_temporal_tensors(
         x = x[indices]
         coords = coords[indices]
         target = target[indices]
-    return x, coords, target
+    source_context, source_strength = afsi_source_to_context(
+        sample, context_points=context_points
+    )
+    return x, coords, target, source_context, source_strength
+
+
+def afsi_source_to_context(
+    sample: Dict[str, Any], *, context_points: int = 100
+) -> Tuple[Tensor, Tensor]:
+    """Reduce AFSI to normalized ``[rho, S_rho]`` tokens and log total strength."""
+
+    afsi = sample.get("afsi")
+    if afsi is None:
+        raise KeyError("Temporal sample is missing the required AFSI source context.")
+    source = afsi["source"].float()
+    if source.ndim != 3 or source.shape[-1] != 1:
+        raise ValueError(
+            "Expected pitch-averaged AFSI source shape [rho, ekin, 1], received "
+            f"{tuple(source.shape)}."
+        )
+    source = torch.nan_to_num(source[..., 0].double(), nan=0.0, posinf=0.0, neginf=0.0)
+    source = source.clamp_min(0.0)
+    source_rho = afsi["rho"].float().reshape(-1)
+    if source.shape[0] != source_rho.numel():
+        raise ValueError("AFSI source and rho coordinate lengths do not match.")
+
+    energy_widths = torch.diff(afsi["ekin_edges"].double().reshape(-1))
+    rho_widths = torch.diff(afsi["rho_edges"].double().reshape(-1))
+    if bool((energy_widths <= 0).any()) or bool((rho_widths <= 0).any()):
+        raise ValueError("AFSI energy and rho bin edges must be strictly increasing.")
+    radial_source = (source * energy_widths[None, :]).sum(dim=1)
+    source_total = (radial_source * rho_widths).sum().clamp_min(0.0)
+    source_reference = (source_total / rho_widths.sum()).clamp_min(1.0e-30)
+    normalized_source = torch.log1p(radial_source / source_reference).float()
+
+    target_rho = torch.linspace(
+        float(source_rho.min()), float(source_rho.max()), steps=context_points
+    )
+    if source_rho.numel() == 1:
+        target_source = normalized_source.expand(context_points)
+    else:
+        upper = torch.searchsorted(source_rho.contiguous(), target_rho.contiguous())
+        upper = upper.clamp(1, source_rho.numel() - 1)
+        lower = upper - 1
+        span = (source_rho[upper] - source_rho[lower]).clamp_min(1.0e-12)
+        weight = ((target_rho - source_rho[lower]) / span).clamp(0.0, 1.0)
+        target_source = (
+            normalized_source[lower] * (1.0 - weight)
+            + normalized_source[upper] * weight
+        )
+    context = torch.stack((target_rho, target_source), dim=-1)
+    strength = torch.log1p(source_total).float().reshape(1)
+    return context, strength
 
 
 def make_temporal_batch(
@@ -126,18 +242,22 @@ def make_temporal_batch(
     profile_log1p: bool,
     generator: torch.Generator,
     device: torch.device,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    xs, positions, targets = [], [], []
+    context_points: int = 100,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    xs, positions, targets, contexts, strengths = [], [], [], [], []
     for sample in samples:
-        x, pos, target = sample_to_temporal_tensors(
+        x, pos, target, context, strength = sample_to_temporal_tensors(
             sample,
             max_nodes=max_nodes,
             profile_log1p=profile_log1p,
             generator=generator,
+            context_points=context_points,
         )
         xs.append(x)
         positions.append(pos)
         targets.append(target)
+        contexts.append(context)
+        strengths.append(strength)
 
     x_batch, mask = _pad_node_tensors(xs)
     pos_batch, _ = _pad_node_tensors(positions)
@@ -147,6 +267,8 @@ def make_temporal_batch(
         pos_batch.to(device),
         mask.to(device),
         target_batch.to(device),
+        torch.stack(contexts).to(device),
+        torch.stack(strengths).to(device),
     )
 
 
@@ -155,10 +277,12 @@ def predict_node_profiles(
     x: Tensor,
     pos: Tensor,
     mask: Tensor,
+    source_context: Tensor,
+    source_strength: Tensor,
 ) -> Tensor:
     """Predict per-node future profile channels and zero padded nodes."""
 
-    prediction = model((x, pos, None))
+    prediction = model((x, pos, source_context, source_strength))
     return prediction * mask.unsqueeze(-1).to(prediction.dtype)
 
 
@@ -191,14 +315,17 @@ def run_epoch(
 
     with context:
         for samples in loader:
-            x, pos, mask, target = make_temporal_batch(
+            x, pos, mask, target, source_context, source_strength = make_temporal_batch(
                 samples,
                 max_nodes=args.max_nodes,
                 profile_log1p=not args.no_profile_log1p,
                 generator=generator,
                 device=device,
+                context_points=args.context_points,
             )
-            prediction = predict_node_profiles(model, x, pos, mask)
+            prediction = predict_node_profiles(
+                model, x, pos, mask, source_context, source_strength
+            )
             loss, mae = masked_field_metrics(prediction, target, mask)
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -247,6 +374,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--analysis-filename", default=DEFAULT_ANALYSIS_FILENAME)
     parser.add_argument("--equilibrium-filename", default=DEFAULT_EQUILIBRIUM_FILENAME)
     parser.add_argument("--bfield-filename", default=DEFAULT_BFIELD_FILENAME)
+    parser.add_argument(
+        "--afsi-filename",
+        default=DEFAULT_AFSI_FILENAME,
+        help=(
+            "AFSI export providing afsi_distribution/distribution_function. Its "
+            "pitch-averaged S(rho, ekin) is persistent model context."
+        ),
+    )
     parser.add_argument("--input-frames", type=int, default=1)
     parser.add_argument("--output-frames", type=int, default=1)
     parser.add_argument(
@@ -291,8 +426,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-profile-log1p",
         action="store_true",
-        help="Disable signed log1p on both input and target profile fields.",
+        help="Disable signed log1p on input and target pressure profiles.",
     )
+    parser.add_argument("--context-points", type=int, default=100)
+    parser.add_argument("--context-hidden-dim", type=int, default=64)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--heads", type=int, default=8)
@@ -359,7 +496,9 @@ def _build_window_dataset(
         analysis_filename=args.analysis_filename,
         equilibrium_filename=args.equilibrium_filename,
         bfield_filename=args.bfield_filename,
+        afsi_filename=args.afsi_filename,
         include_bfield=True,
+        include_afsi=True,
         include_target=False,
         strict=True,
         temporal_static_cache_size=args.temporal_static_cache_size,
@@ -444,6 +583,25 @@ def _save_checkpoint(
                         for field in ("prs_para", "prs_perp")
                     ],
                 },
+                "afsi_context": {
+                    "source": "pitch_averaged_afsi_distribution_function",
+                    "file": args.afsi_filename,
+                    "datasets": [
+                        "afsi_distribution/distribution_function",
+                    ],
+                    "reduction": "S_rho(rho) = sum_E S(rho,E) * delta_E",
+                    "tokens": (
+                        "[rho, log1p(S_rho/S_ref)] -> "
+                        f"MLP(2,{args.context_hidden_dim},d_model)"
+                    ),
+                    "shape": f"[{args.context_points}, d_model]",
+                    "source_strength": "log1p(sum_rho S_rho * delta_rho)",
+                    "injection": "slice-token cross-attention in every block",
+                    "persistence": "fixed for the complete trajectory",
+                    "temporal_windows": (
+                        "ordinary ASCOT input/target windows; frame zero is an input"
+                    ),
+                },
             },
             path,
         )
@@ -455,6 +613,7 @@ _RESUME_FIXED_ARGS = (
     "analysis_filename",
     "equilibrium_filename",
     "bfield_filename",
+    "afsi_filename",
     "input_frames",
     "output_frames",
     "frame_stride",
@@ -473,11 +632,23 @@ _RESUME_FIXED_ARGS = (
     "slice_num",
     "dropout",
     "mlp_ratio",
+    "context_points",
+    "context_hidden_dim",
 )
 
 
 def _validate_resume_args(checkpoint: Dict[str, Any], args: argparse.Namespace) -> None:
     saved_args = checkpoint.get("args", {})
+    afsi_context = checkpoint.get("afsi_context", {})
+    if (
+        "afsi_filename" not in saved_args
+        or afsi_context.get("source")
+        != "pitch_averaged_afsi_distribution_function"
+    ):
+        raise ValueError(
+            "Cannot resume a checkpoint that was not conditioned on pitch-averaged "
+            "AFSI S(rho, ekin)."
+        )
     mismatches = []
     for name in _RESUME_FIXED_ARGS:
         if name not in saved_args:
@@ -542,6 +713,8 @@ def main() -> None:
         raise ValueError("--epochs must be positive.")
     if args.max_nodes is not None and args.max_nodes <= 0:
         raise ValueError("--max-nodes must be positive when provided.")
+    if args.context_points <= 0 or args.context_hidden_dim <= 0:
+        raise ValueError("AFSI context dimensions must be positive.")
 
     requested_device = torch.device(args.device)
     launch_world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -610,6 +783,14 @@ def main() -> None:
                 args.equilibrium_filename,
                 args.bfield_filename,
             )
+            folders = [
+                folder for folder in folders if (folder / args.afsi_filename).is_file()
+            ]
+            if not folders:
+                raise ValueError(
+                    "No discovered sample folders also contain the required AFSI "
+                    f"file {args.afsi_filename!r}."
+                )
             if args.max_samples is not None:
                 folders = folders[: args.max_samples]
             folder_payload[0] = folders
@@ -670,11 +851,12 @@ def main() -> None:
     batch_generator = torch.Generator().manual_seed(args.seed + rank)
     validation_generator = torch.Generator().manual_seed(args.seed + 1 + rank)
     validation_generator_state = validation_generator.get_state().clone()
-    first_x, _, first_target = sample_to_temporal_tensors(
+    first_x, _, first_target, first_context, _ = sample_to_temporal_tensors(
         train_dataset[0],
         max_nodes=min(args.max_nodes or 1024, 1024),
         profile_log1p=not args.no_profile_log1p,
         generator=batch_generator,
+        context_points=args.context_points,
     )
     input_dim = int(first_x.shape[-1])
     output_dim = int(first_target.shape[-1])
@@ -689,8 +871,10 @@ def main() -> None:
         "dropout": args.dropout,
         "mlp_ratio": args.mlp_ratio,
         "unified_pos": False,
+        "context_points": args.context_points,
+        "context_hidden_dim": args.context_hidden_dim,
     }
-    model = TransolverPlusModel(**model_config).to(device)
+    model = AFSIContextTransolverModel(**model_config).to(device)
     # Temporal forecasting never supplies the optional three-value condition.
     # Freeze its embedding so DDP does not wait for gradients that cannot exist.
     if hasattr(model, "embedding"):
@@ -744,6 +928,7 @@ def main() -> None:
             else ""
         )
         + f"; input_frames={args.input_frames}, output_frames={args.output_frames}, "
+        f"afsi_context={tuple(first_context.shape)} from {args.afsi_filename}, "
         f"input_dim={input_dim}, output_dim={output_dim}, batch_size={args.batch_size}, "
         f"global_batch_size={args.batch_size * world_size}, world_size={world_size}, "
         f"num_workers={args.num_workers}, static_cache_size={args.temporal_static_cache_size}, "
@@ -751,19 +936,23 @@ def main() -> None:
     )
 
     if args.dry_run:
-        x, pos, mask, target = make_temporal_batch(
+        x, pos, mask, target, source_context, source_strength = make_temporal_batch(
             next(iter(train_loader)),
             max_nodes=args.max_nodes,
             profile_log1p=not args.no_profile_log1p,
             generator=batch_generator,
             device=device,
+            context_points=args.context_points,
         )
         model.eval()
         with torch.no_grad():
-            prediction = predict_node_profiles(model, x, pos, mask)
+            prediction = predict_node_profiles(
+                model, x, pos, mask, source_context, source_strength
+            )
         _rank_zero_print(
             f"dry_run per_rank_x={tuple(x.shape)} pos={tuple(pos.shape)} "
-            f"target={tuple(target.shape)} prediction={tuple(prediction.shape)}, "
+            f"context={tuple(source_context.shape)} target={tuple(target.shape)} "
+            f"prediction={tuple(prediction.shape)}, "
             f"world_size={world_size}"
         )
         _cleanup_distributed()

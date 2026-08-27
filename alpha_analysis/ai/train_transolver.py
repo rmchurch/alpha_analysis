@@ -104,6 +104,24 @@ def _patched_attention_forward(self: Physics_Attention_1D_Eidetic, x: Tensor) ->
         v_slice_token,
     )
 
+    context_tokens = getattr(self, "_context_tokens", None)
+    if context_tokens is not None:
+        # Reassemble the per-head physics slices so they can query the AFSI
+        # context tokens with ordinary d_model multi-head cross-attention.
+        physics_slices = out_slice_token.permute(0, 2, 1, 3).reshape(
+            batch_size, out_slice_token.shape[2], -1
+        )
+        cross_output, _ = self.context_cross_attention(
+            physics_slices,
+            context_tokens,
+            context_tokens,
+            need_weights=False,
+        )
+        physics_slices = self.context_cross_norm(physics_slices + cross_output)
+        out_slice_token = physics_slices.reshape(
+            batch_size, out_slice_token.shape[2], self.heads, self.dim_head
+        ).permute(0, 2, 1, 3).contiguous()
+
     out_x = _slice_to_node_tokens(out_slice_token, slice_weights)
     out_x = out_x.permute(0, 2, 1, 3).reshape(batch_size, num_nodes, -1)
     return self.to_out(out_x)
