@@ -29,6 +29,7 @@ from alpha_analysis.ai.train_transolver import (
     _cleanup_distributed,
     _discover_sample_folders,
     _ensure_distributed,
+    _read_folder_manifest,
     patch_transolver_attention_for_cuda,
 )
 from alpha_analysis.ai.train_transolver_timedependent import (
@@ -546,7 +547,7 @@ def _plot_rho_examples(
         "Autoregressive Transolver validation rollouts: all pressure points vs rho",
         fontsize=15,
     )
-    fig.subplots_adjust(left=0.085, right=0.985, bottom=0.045, top=0.955)
+    fig.subplots_adjust(left=0.085, right=0.985, bottom=0.045, top=0.925)
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=200)
     plt.close(fig)
@@ -574,7 +575,17 @@ def main() -> None:
     ]
     if saved_args.get("max_samples") is not None:
         folders = folders[: int(saved_args["max_samples"])]
-    _, val_folders = _split_folders(folders, float(saved_args["train_fraction"]), int(saved_args["seed"]))
+    saved_train_manifest = saved_args.get("train_folders")
+    saved_val_manifest = saved_args.get("val_folders")
+    if saved_train_manifest and saved_val_manifest:
+        # Manifest-based runs must be plotted against the exact validation set
+        # used during training; recomputing a random split would silently pick
+        # different simulations.
+        val_folders = _read_folder_manifest(Path(saved_val_manifest), results_root)
+    else:
+        _, val_folders = _split_folders(
+            folders, float(saved_args["train_fraction"]), int(saved_args["seed"])
+        )
     selected = _parse_indices(args.indices, len(val_folders))
 
     dataset = Ascot5Dataset(

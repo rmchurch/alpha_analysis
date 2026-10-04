@@ -1,0 +1,204 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1280" viewBox="0 0 1800 1280" role="img" aria-labelledby="title desc">
+  <title id="title">AFSI-conditioned temporal Transolver++ architecture</title>
+  <desc id="desc">Architecture diagram for the AFSI-conditioned temporal Transolver used to forecast ASCOT5 fast-ion pressure profiles and evaluate synthetic global fast-ion loss.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,3 L0,6 Z" fill="#24445c"/>
+    </marker>
+    <marker id="blue-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,3 L0,6 Z" fill="#1479a6"/>
+    </marker>
+    <marker id="green-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,3 L0,6 Z" fill="#16805b"/>
+    </marker>
+    <marker id="orange-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,3 L0,6 Z" fill="#b35a12"/>
+    </marker>
+    <style>
+      .title { font: 700 32px Arial, Helvetica, sans-serif; fill: #17324a; }
+      .subtitle { font: 17px Arial, Helvetica, sans-serif; fill: #506579; }
+      .section { font: 700 21px Arial, Helvetica, sans-serif; fill: #17324a; }
+      .card-title { font: 700 20px Arial, Helvetica, sans-serif; fill: #17324a; }
+      .body { font: 16px Arial, Helvetica, sans-serif; fill: #263b4d; }
+      .small { font: 14px Arial, Helvetica, sans-serif; fill: #526a7e; }
+      .tiny { font: 13px Arial, Helvetica, sans-serif; fill: #526a7e; }
+      .formula { font: 700 16px Arial, Helvetica, sans-serif; fill: #17324a; }
+      .box { stroke-width: 2; rx: 14; }
+      .input { fill: #eef7fb; stroke: #5aa4c2; }
+      .afsi { fill: #eefaf4; stroke: #4caa80; }
+      .prep { fill: #f3efff; stroke: #886ed1; }
+      .model { fill: #f8fafc; stroke: #5f7890; }
+      .attention { fill: #edf3ff; stroke: #4b7fc4; }
+      .cross { fill: #eaf8fb; stroke: #1479a6; }
+      .output { fill: #fff7e8; stroke: #c47a24; }
+      .downstream { fill: #f7f0ff; stroke: #8d68c2; }
+      .dash { fill: none; stroke: #1479a6; stroke-width: 3; stroke-dasharray: 9 7; marker-end: url(#blue-arrow); }
+      .flow { fill: none; stroke: #24445c; stroke-width: 2.6; marker-end: url(#arrow); }
+      .green-flow { fill: none; stroke: #16805b; stroke-width: 2.6; marker-end: url(#green-arrow); }
+      .orange-flow { fill: none; stroke: #b35a12; stroke-width: 2.6; marker-end: url(#orange-arrow); }
+      .loop { fill: none; stroke: #b35a12; stroke-width: 2.8; stroke-dasharray: 10 7; marker-end: url(#orange-arrow); }
+      .label-bg { fill: #ffffff; opacity: .92; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1280" fill="#ffffff"/>
+  <text x="40" y="46" class="title">AFSI-conditioned temporal Transolver++</text>
+  <text x="40" y="76" class="subtitle">ASCOT5 profile forecasting with persistent AFSI birth-distribution context | current run: input=1 frame, output=1 frame, hidden=128, blocks=4, heads=8, slices=32</text>
+
+  <!-- Inputs -->
+  <rect x="40" y="105" width="410" height="260" class="box input"/>
+  <text x="65" y="139" class="card-title">1. ASCOT5 state at time t</text>
+  <text x="65" y="169" class="body">Profile fields:</text>
+  <text x="205" y="169" class="formula">prs_para(t), prs_perp(t)</text>
+  <text x="65" y="198" class="body">Geometry:</text>
+  <text x="205" y="198" class="formula">rho, theta, phi</text>
+  <text x="65" y="227" class="body">Magnetic field:</text>
+  <text x="205" y="227" class="formula">Br, Bphi, Bz</text>
+  <line x1="65" y1="244" x2="515" y2="244" stroke="#a7c9d8"/>
+  <text x="65" y="272" class="small">profiles_to_node_channels: signed_log1p</text>
+  <text x="65" y="301" class="formula">x = [coords(3) | profiles(2) | B(3)] = [N, 8]</text>
+  <text x="65" y="332" class="small">N = up to 171,462 mesh nodes (sampled during training)</text>
+
+  <rect x="820" y="105" width="500" height="260" class="box afsi"/>
+  <text x="845" y="139" class="card-title">2. AFSI source context</text>
+  <text x="845" y="169" class="body">afsi_initial.h5: pitch-averaged source</text>
+  <text x="845" y="198" class="formula">S(rho, Ekin)</text>
+  <text x="845" y="228" class="body">energy-bin integrate → radial source S_rho(rho)</text>
+  <text x="845" y="257" class="body">normalize + log1p → interpolate on 100 rho points</text>
+  <line x1="845" y1="272" x2="1295" y2="272" stroke="#9bcdb5"/>
+  <text x="845" y="301" class="formula">context = [(rho_i, S_rho_i)] ∈ R^[100, 2]</text>
+  <text x="845" y="332" class="formula">strength = log1p(total weighted source) ∈ R^[1]</text>
+
+  <!-- Preparation -->
+  <rect x="490" y="105" width="300" height="260" class="box prep"/>
+  <text x="515" y="139" class="card-title">3a. Input lifting (internal)</text>
+  <text x="515" y="179" class="body">Existing Transolver preprocess MLP</text>
+  <text x="515" y="208" class="formula">8 → 256 → 128</text>
+  <text x="515" y="249" class="body">+ learnable placeholder</text>
+  <text x="515" y="291" class="formula">fx_0 ∈ R^[B, N, 128]</text>
+  <text x="515" y="329" class="small">one node token per mesh point</text>
+
+  <rect x="1340" y="105" width="420" height="260" class="box prep"/>
+  <text x="1365" y="139" class="card-title">3b. AFSI embedding</text>
+  <text x="1365" y="179" class="body">source_encoder:</text>
+  <text x="1365" y="208" class="formula">2 → 64 → 128</text>
+  <text x="1365" y="249" class="body">+ strength_embedding:</text>
+  <text x="1365" y="278" class="formula">1 → 128, broadcast</text>
+  <text x="1365" y="320" class="formula">C ∈ R^[B, 100, 128]</text>
+
+  <path d="M450 235 H490" class="flow"/>
+  <path d="M1320 235 H1340" class="green-flow"/>
+
+  <!-- Repeated model block -->
+  <rect x="40" y="405" width="1720" height="390" class="box model"/>
+  <text x="65" y="441" class="section">4. AFSI-conditioned Transolver block × 4</text>
+  <text x="65" y="468" class="small">The same encoded AFSI context C is attached to every block; physics slice tokens query C as cross-attention keys/values.</text>
+
+  <rect x="75" y="505" width="175" height="225" class="box model"/>
+  <text x="95" y="540" class="card-title">Node latent</text>
+  <text x="95" y="577" class="formula">fx [B,N,128]</text>
+  <text x="95" y="620" class="body">LayerNorm</text>
+  <text x="95" y="661" class="body">residual path</text>
+  <text x="95" y="702" class="tiny">input to physics attention</text>
+
+  <rect x="285" y="505" width="375" height="225" class="box attention"/>
+  <text x="307" y="538" class="card-title">Physics attention</text>
+  <text x="307" y="570" class="body">8 heads × 16 channels/head</text>
+  <text x="307" y="600" class="body">Gumbel-softmax node → 32 slices</text>
+  <text x="307" y="630" class="body">weighted pool: N nodes → 32 tokens</text>
+  <text x="307" y="660" class="body">self-attention over physics slices</text>
+  <text x="307" y="699" class="formula">physics slices [B,32,128]</text>
+
+  <rect x="700" y="505" width="390" height="225" class="box cross"/>
+  <text x="722" y="538" class="card-title">AFSI cross-attention</text>
+  <text x="722" y="572" class="formula">Q = physics slices [B,32,128]</text>
+  <text x="722" y="603" class="formula">K,V = AFSI context C [B,100,128]</text>
+  <text x="722" y="638" class="body">8-head MultiheadAttention</text>
+  <text x="722" y="669" class="body">cross-output + residual LayerNorm</text>
+  <text x="722" y="704" class="tiny">context injection happens inside every block</text>
+
+  <rect x="1130" y="505" width="250" height="225" class="box attention"/>
+  <text x="1152" y="538" class="card-title">Reassemble</text>
+  <text x="1152" y="578" class="body">32 slices → N nodes</text>
+  <text x="1152" y="612" class="body">merge 8 heads</text>
+  <text x="1152" y="646" class="body">linear output projection</text>
+  <text x="1152" y="694" class="formula">attention output + fx</text>
+
+  <rect x="1420" y="505" width="285" height="225" class="box model"/>
+  <text x="1442" y="538" class="card-title">MLP residual</text>
+  <text x="1442" y="578" class="body">LayerNorm</text>
+  <text x="1442" y="610" class="formula">128 → 256 → 128</text>
+  <text x="1442" y="648" class="body">+ residual connection</text>
+  <text x="1442" y="691" class="formula">fx_next [B,N,128]</text>
+
+  <path d="M250 617 H285" class="flow"/>
+  <path d="M660 617 H700" class="flow"/>
+  <path d="M1090 617 H1130" class="flow"/>
+  <path d="M1380 617 H1420" class="flow"/>
+  <path d="M1705 617 H1740" class="flow"/>
+  <text x="1708" y="602" class="tiny">repeat</text>
+  <path d="M1740 617 V760 H180 V730" class="loop"/>
+  <text x="1320" y="775" class="small">blocks 1–4; block 4 projects to two output channels</text>
+
+  <!-- AFSI persistent path -->
+  <path d="M1550 365 V445 H895 V505" class="dash"/>
+  <rect x="1135" y="390" width="380" height="30" class="label-bg"/>
+  <text x="1145" y="411" class="small">persistent AFSI context: same C in every block</text>
+
+  <path d="M640 365 V450 H165 V505" class="flow"/>
+  <text x="455" y="443" class="small">initial node latent fx_0</text>
+
+  <!-- Output and rollout -->
+  <rect x="75" y="850" width="300" height="185" class="box output"/>
+  <text x="98" y="885" class="card-title">5. Next-frame output</text>
+  <text x="98" y="922" class="body">last block:</text>
+  <text x="190" y="922" class="formula">LayerNorm → Linear</text>
+  <text x="98" y="954" class="formula">128 → 2 channels/node</text>
+  <text x="98" y="991" class="body">prediction in signed-log1p space</text>
+
+  <rect x="430" y="850" width="300" height="185" class="box output"/>
+  <text x="453" y="885" class="card-title">6. Profile reconstruction</text>
+  <text x="453" y="925" class="body">signed_expm1</text>
+  <text x="453" y="958" class="body">reshape node channels</text>
+  <text x="453" y="994" class="formula">prs_para(t+1), prs_perp(t+1)</text>
+
+  <rect x="785" y="850" width="420" height="185" class="box output"/>
+  <text x="808" y="885" class="card-title">7. Autoregressive rollout</text>
+  <text x="808" y="923" class="body">seed with real ASCOT5 frame t0</text>
+  <text x="808" y="956" class="body">predict one frame → append to history</text>
+  <text x="808" y="989" class="body">feed latest frame back as next input</text>
+  <text x="808" y="1021" class="formula">AFSI context stays fixed throughout</text>
+
+  <path d="M1560 730 V815 H225 V850" class="orange-flow"/>
+  <path d="M375 942 H430" class="orange-flow"/>
+  <path d="M730 942 H785" class="orange-flow"/>
+  <path d="M1205 942 H1260 V835 H1080 V790" class="loop"/>
+  <text x="1195" y="825" class="small">append + feed back</text>
+
+  <!-- Downstream evaluation -->
+  <rect x="40" y="1090" width="1720" height="145" class="box downstream"/>
+  <text x="65" y="1123" class="section">Optional downstream test on later/unseen ASCOT5 simulations</text>
+  <text x="65" y="1153" class="body">Rolled-out synthetic trajectory</text>
+  <path d="M390 1148 H520" class="flow"/>
+  <rect x="540" y="1125" width="300" height="72" class="box downstream"/>
+  <text x="565" y="1154" class="card-title">Static Transolver</text>
+  <text x="565" y="1179" class="small">profile field → fraction_lost</text>
+  <path d="M840 1161 H930" class="flow"/>
+  <rect x="950" y="1125" width="325" height="72" class="box downstream"/>
+  <text x="975" y="1154" class="card-title">Latent scalar head</text>
+  <text x="975" y="1179" class="small">captured out_slice_tokens → loss</text>
+  <path d="M1275 1161 H1360" class="flow"/>
+  <rect x="1380" y="1125" width="350" height="72" class="box output"/>
+  <text x="1405" y="1154" class="card-title">Compare with ASCOT5</text>
+  <text x="1405" y="1179" class="small">ground-truth global fraction_lost</text>
+
+  <!-- Legend -->
+  <line x1="65" y1="1260" x2="125" y2="1260" class="flow"/>
+  <text x="135" y="1265" class="tiny">profile / latent flow</text>
+  <line x1="315" y1="1260" x2="375" y2="1260" class="green-flow"/>
+  <text x="385" y="1265" class="tiny">AFSI preprocessing</text>
+  <line x1="565" y1="1260" x2="625" y2="1260" class="dash"/>
+  <text x="635" y="1265" class="tiny">persistent context injection</text>
+  <line x1="875" y1="1260" x2="935" y2="1260" class="loop"/>
+  <text x="945" y="1265" class="tiny">autoregressive loop</text>
+</svg>

@@ -10,3 +10,5 @@ fraction_lost_*.csv
 fraction_lost_*.png
 output.txt
 tmp.png
+slurm-*.out
+slurm-*.err

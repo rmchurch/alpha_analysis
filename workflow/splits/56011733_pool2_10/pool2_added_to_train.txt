@@ -1,0 +1,10 @@
+/global/cfs/cdirs/m5300/results/G1600/G1600_00909
+/global/cfs/cdirs/m5300/results/G1600/G1600_00944
+/global/cfs/cdirs/m5300/results/G1600/G1600_00978
+/global/cfs/cdirs/m5300/results/G1600/G1600_01017
+/global/cfs/cdirs/m5300/results/G1600/G1600_01089
+/global/cfs/cdirs/m5300/results/G1600/G1600_01141
+/global/cfs/cdirs/m5300/results/G1600/G1600_01201
+/global/cfs/cdirs/m5300/results/G1600/G1600_01264
+/global/cfs/cdirs/m5300/results/G1600/G1600_01320
+/global/cfs/cdirs/m5300/results/G1600/G1600_01402

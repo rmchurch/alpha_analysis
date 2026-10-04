@@ -27,6 +27,7 @@ from .train_transolver import (
     _ensure_distributed,
     _node_to_slice_tokens,
     _profile_channels,
+    _read_folder_manifest,
     _reduce_target,
     _slice_to_node_tokens,
     _split_indices,
@@ -431,6 +432,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--train-folders",
+        type=Path,
+        help="Explicit training folder manifest; must be paired with --val-folders.",
+    )
+    parser.add_argument(
+        "--val-folders",
+        type=Path,
+        help="Explicit validation folder manifest; must be paired with --train-folders.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         help="Directory for token .pt files, manifest.jsonl, and metadata.json.",
@@ -493,6 +504,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if (args.train_folders is None) != (args.val_folders is None):
+        raise ValueError("--train-folders and --val-folders must be provided together.")
+    if args.folders_file is not None and args.train_folders is not None:
+        raise ValueError("Use either --folders-file or explicit train/val manifests, not both.")
     run_dir = (args.run_dir or _default_run_dir()).expanduser().resolve()
     config = _load_json(run_dir / "config.json")
     saved_args = config["args"]
@@ -518,7 +533,18 @@ def main() -> None:
         results_root,
     )
 
-    if args.folders_file is not None:
+    explicit_split = args.train_folders is not None and args.val_folders is not None
+    if explicit_split:
+        train_folders = _read_folder_manifest(args.train_folders.expanduser(), results_root)
+        val_folders = _read_folder_manifest(args.val_folders.expanduser(), results_root)
+        overlap = {folder.name for folder in train_folders} & {folder.name for folder in val_folders}
+        if overlap:
+            raise ValueError(
+                "Training and validation manifests overlap; first duplicate: "
+                f"{sorted(overlap)[0]}"
+            )
+        folders = train_folders + val_folders
+    elif args.folders_file is not None:
         folders = _read_folder_list(args.folders_file.expanduser())
     else:
         folders = _discover_sample_folders(
@@ -573,6 +599,16 @@ def main() -> None:
                 for sample_index, (dataset_index, _) in enumerate(new_folder_records)
             ]
         }
+    elif explicit_split:
+        train_indices = list(range(len(train_folders)))
+        val_indices = list(range(len(train_folders), len(folders)))
+        split_indices = {
+            "train": [(dataset_index, dataset_index) for dataset_index in train_indices],
+            "val": [(dataset_index, dataset_index) for dataset_index in val_indices],
+        }
+        selected_splits = list(dict.fromkeys(args.splits))
+        if "val" in selected_splits and not val_indices:
+            raise ValueError("This run has no validation split.")
     else:
         train_indices, val_indices = _split_indices(
             len(dataset),

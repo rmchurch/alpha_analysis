@@ -1,0 +1,13 @@
+diff --git a/a5py/ascot5io/plasma.py b/a5py/ascot5io/plasma.py
+index cb9bde5b..7422a29e 100644
+--- a/a5py/ascot5io/plasma.py
++++ b/a5py/ascot5io/plasma.py
+@@ -36 +36 @@ class plasma_1D(DataGroup):
+-                    out[key] = int(out[key])
++                    out[key] = int(out[key].item())
+@@ -231 +231 @@ class plasma_1DS(DataGroup):
+-                    out[key] = int(out[key])
++                    out[key] = int(out[key].item())
+@@ -424 +424 @@ class plasma_1Dt(DataGroup):
+-                    out[key] = int(out[key])
++                    out[key] = int(out[key].item())

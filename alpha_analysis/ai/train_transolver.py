@@ -197,6 +197,39 @@ def _discover_sample_folders(
     return folders
 
 
+def _read_folder_manifest(path: Path, results_root: Path) -> List[Path]:
+    """Read a folder manifest, resolving cluster path aliases."""
+
+    folders: List[Path] = []
+    missing: List[str] = []
+    for line in path.expanduser().read_text().splitlines():
+        saved = line.strip()
+        if not saved or saved.startswith("#"):
+            continue
+        candidate = Path(saved).expanduser()
+        candidates = [candidate, results_root / candidate.name]
+        text = str(candidate)
+        if text.startswith("/global/cfs/cdirs/"):
+            candidates.append(Path(text.replace("/global/cfs/cdirs/", "/global/cfs/projectdirs/", 1)))
+        elif text.startswith("/global/cfs/projectdirs/"):
+            candidates.append(Path(text.replace("/global/cfs/projectdirs/", "/global/cfs/cdirs/", 1)))
+        match = next((item.resolve() for item in candidates if item.is_dir()), None)
+        if match is None:
+            missing.append(saved)
+        else:
+            folders.append(match)
+    if missing:
+        raise FileNotFoundError(
+            f"Could not resolve {len(missing)} folders from {path}; first missing: {missing[0]}"
+        )
+    if not folders:
+        raise ValueError(f"Folder manifest is empty: {path}")
+    keys = [folder.name for folder in folders]
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"Folder manifest contains duplicate sample names: {path}")
+    return folders
+
+
 def _default_target_database_path(results_root: Path) -> Path | None:
     database_path = results_root / "G1600_end_database.json"
     return database_path if database_path.is_file() else None
@@ -417,6 +450,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("/global/cfs/cdirs/m5300/results/G1600"),
     )
+    parser.add_argument(
+        "--train-folders",
+        type=Path,
+        help="Explicit training folder manifest; must be paired with --val-folders.",
+    )
+    parser.add_argument(
+        "--val-folders",
+        type=Path,
+        help="Explicit validation folder manifest; must be paired with --train-folders.",
+    )
     parser.add_argument("--save-dir", type=Path, default=Path("runs/transolver_alpha"))
     parser.add_argument("--analysis-filename", default=DEFAULT_ANALYSIS_FILENAME)
     parser.add_argument("--equilibrium-filename", default=DEFAULT_EQUILIBRIUM_FILENAME)
@@ -505,6 +548,8 @@ def main() -> None:
         raise ValueError("--train-fraction must be in (0, 1].")
     if args.max_nodes is not None and args.max_nodes <= 0:
         raise ValueError("--max-nodes must be positive when provided.")
+    if (args.train_folders is None) != (args.val_folders is None):
+        raise ValueError("--train-folders and --val-folders must be provided together.")
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -519,14 +564,26 @@ def main() -> None:
     )
     args.target_database = target_database_path
 
-    folders = _discover_sample_folders(
-        results_root,
-        args.analysis_filename,
-        args.equilibrium_filename,
-        args.bfield_filename,
-    )
-    if args.max_samples is not None:
-        folders = folders[: args.max_samples]
+    explicit_split = args.train_folders is not None and args.val_folders is not None
+    if explicit_split:
+        train_folders = _read_folder_manifest(args.train_folders, results_root)
+        val_folders = _read_folder_manifest(args.val_folders, results_root)
+        overlap = {folder.name for folder in train_folders} & {folder.name for folder in val_folders}
+        if overlap:
+            raise ValueError(
+                "Training and validation manifests overlap; first duplicate: "
+                f"{sorted(overlap)[0]}"
+            )
+        folders = train_folders + val_folders
+    else:
+        folders = _discover_sample_folders(
+            results_root,
+            args.analysis_filename,
+            args.equilibrium_filename,
+            args.bfield_filename,
+        )
+        if args.max_samples is not None:
+            folders = folders[: args.max_samples]
 
     dataset = Ascot5Dataset(
         folders,
@@ -538,7 +595,11 @@ def main() -> None:
         target_database_path=target_database_path,
         target_database_key=args.target_database_key,
     )
-    train_indices, val_indices = _split_indices(len(dataset), args.train_fraction, args.seed)
+    if explicit_split:
+        train_indices = list(range(len(train_folders)))
+        val_indices = list(range(len(train_folders), len(folders)))
+    else:
+        train_indices, val_indices = _split_indices(len(dataset), args.train_fraction, args.seed)
     train_dataset = Subset(dataset, train_indices)
     val_dataset = Subset(dataset, val_indices) if val_indices else None
 

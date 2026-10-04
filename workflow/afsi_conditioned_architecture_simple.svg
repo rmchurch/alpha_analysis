@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Simple AFSI-conditioned temporal Transolver block diagram</title>
+  <desc id="desc">Simple block diagram showing ASCOT5 profiles and AFSI context entering a conditioned temporal Transolver, followed by autoregressive rollout and global fast-ion loss evaluation.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,4 L0,8 Z" fill="#29465d"/>
+    </marker>
+    <marker id="green-arrow" markerWidth="12" markerHeight="12" refX="10" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,4 L0,8 Z" fill="#16805b"/>
+    </marker>
+    <marker id="orange-arrow" markerWidth="12" markerHeight="12" refX="10" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,4 L0,8 Z" fill="#b35a12"/>
+    </marker>
+    <style>
+      .title { font: 700 34px Arial, Helvetica, sans-serif; fill: #17324a; }
+      .subtitle { font: 18px Arial, Helvetica, sans-serif; fill: #506579; }
+      .heading { font: 700 23px Arial, Helvetica, sans-serif; fill: #17324a; }
+      .body { font: 18px Arial, Helvetica, sans-serif; fill: #263b4d; }
+      .small { font: 16px Arial, Helvetica, sans-serif; fill: #526a7e; }
+      .box { stroke-width: 2.5; rx: 18; }
+      .input { fill: #eef7fb; stroke: #5aa4c2; }
+      .afsi { fill: #eefaf4; stroke: #4caa80; }
+      .model { fill: #edf3ff; stroke: #4b7fc4; }
+      .output { fill: #fff7e8; stroke: #c47a24; }
+      .loss { fill: #f7f0ff; stroke: #8d68c2; }
+      .flow { fill: none; stroke: #29465d; stroke-width: 3.5; marker-end: url(#arrow); }
+      .green-flow { fill: none; stroke: #16805b; stroke-width: 3.5; marker-end: url(#green-arrow); }
+      .orange-flow { fill: none; stroke: #b35a12; stroke-width: 3.5; marker-end: url(#orange-arrow); }
+      .loop { fill: none; stroke: #b35a12; stroke-width: 3.5; stroke-dasharray: 11 8; marker-end: url(#orange-arrow); }
+    </style>
+  </defs>
+
+  <rect width="1600" height="900" fill="#ffffff"/>
+  <text x="55" y="55" class="title">AFSI-conditioned temporal Transolver++</text>
+  <text x="55" y="87" class="subtitle">Simple view of the data flow used for ASCOT5 profile forecasting</text>
+
+  <!-- Main inputs -->
+  <rect x="55" y="150" width="390" height="190" class="box input"/>
+  <text x="82" y="190" class="heading">ASCOT5 state at time t</text>
+  <text x="82" y="230" class="body">Profiles: prs_para, prs_perp</text>
+  <text x="82" y="262" class="body">Coordinates + magnetic field</text>
+  <text x="82" y="304" class="small">Mesh-node features → [N, 8]</text>
+
+  <rect x="55" y="420" width="390" height="190" class="box afsi"/>
+  <text x="82" y="460" class="heading">AFSI birth source</text>
+  <text x="82" y="500" class="body">S(rho, Ekin) from afsi_initial.h5</text>
+  <text x="82" y="532" class="body">Reduce to radial S_rho(rho)</text>
+  <text x="82" y="574" class="small">100 context points + total-source strength</text>
+
+  <!-- Embeddings -->
+  <rect x="520" y="150" width="300" height="190" class="box input"/>
+  <text x="547" y="190" class="heading">Input lifting (internal)</text>
+  <text x="547" y="238" class="body">Existing Transolver preprocess MLP</text>
+  <text x="547" y="274" class="body">8 → 256 → 128 → node tokens</text>
+
+  <rect x="520" y="420" width="300" height="190" class="box afsi"/>
+  <text x="547" y="460" class="heading">AFSI embedding</text>
+  <text x="547" y="508" class="body">Source encoder</text>
+  <text x="547" y="544" class="body">→ context tokens [100, 128]</text>
+  <text x="547" y="580" class="small">plus strength embedding</text>
+
+  <path d="M445 245 H520" class="flow"/>
+  <path d="M445 515 H520" class="green-flow"/>
+
+  <!-- Core model -->
+  <rect x="895" y="205" width="450" height="350" class="box model"/>
+  <text x="925" y="250" class="heading">AFSI-conditioned Transolver</text>
+  <text x="925" y="284" class="body">4 repeated blocks</text>
+  <text x="925" y="334" class="body">Physics slice attention</text>
+  <text x="925" y="370" class="body">+ AFSI cross-attention</text>
+  <text x="925" y="406" class="body">+ residual MLP updates</text>
+  <line x1="925" y1="430" x2="1315" y2="430" stroke="#a9c2df" stroke-width="2"/>
+  <text x="925" y="470" class="small">Node tokens query AFSI tokens</text>
+  <text x="925" y="504" class="small">AFSI context is reused in every block</text>
+
+  <path d="M820 245 H895" class="flow"/>
+  <path d="M820 515 H865 V370 H895" class="green-flow"/>
+
+  <!-- Forecast output -->
+  <rect x="1420" y="205" width="125" height="350" class="box output"/>
+  <text x="1444" y="258" class="heading">Next</text>
+  <text x="1444" y="292" class="heading">profile</text>
+  <text x="1444" y="350" class="body">para</text>
+  <text x="1444" y="384" class="body">perp</text>
+  <text x="1444" y="446" class="small">t + 1</text>
+  <path d="M1345 380 H1420" class="orange-flow"/>
+
+  <!-- Rollout -->
+  <rect x="55" y="700" width="600" height="125" class="box output"/>
+  <text x="82" y="742" class="heading">Autoregressive rollout</text>
+  <text x="82" y="780" class="body">Append predicted frame and feed it back as the next input</text>
+  <text x="82" y="808" class="small">The AFSI context remains fixed throughout the rollout</text>
+
+  <path d="M1482 555 V650 H355 V700" class="orange-flow"/>
+  <path d="M655 762 H760 V650 H865 V515" class="loop"/>
+  <text x="690" y="642" class="small">feed latest frame back</text>
+
+  <!-- Optional global loss evaluation -->
+  <rect x="895" y="700" width="650" height="125" class="box loss"/>
+  <text x="925" y="742" class="heading">Held-out synthetic ASCOT5 test</text>
+  <text x="925" y="780" class="body">Rolled-out trajectory → global fast-ion loss prediction</text>
+  <text x="925" y="808" class="small">Static Transolver or latent scalar head → fraction_lost</text>
+
+  <path d="M655 762 H895" class="flow"/>
+
+  <!-- Legend -->
+  <line x1="55" y1="870" x2="105" y2="870" class="flow"/>
+  <text x="118" y="876" class="small">profile / latent flow</text>
+  <line x1="330" y1="870" x2="380" y2="870" class="green-flow"/>
+  <text x="393" y="876" class="small">AFSI context flow</text>
+  <line x1="600" y1="870" x2="650" y2="870" class="loop"/>
+  <text x="663" y="876" class="small">autoregressive feedback</text>
+</svg>

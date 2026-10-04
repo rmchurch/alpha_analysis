@@ -380,7 +380,13 @@ def _read_existing_rows(path: Path) -> list[dict[str, Any]]:
         return list(csv.DictReader(file))
 
 
-def _plot_parity(path: Path, rows: Sequence[dict[str, Any]]) -> None:
+def _plot_parity(
+    path: Path,
+    rows: Sequence[dict[str, Any]],
+    *,
+    pool_colored: bool = False,
+    title_prefix: str = "Later/unseen",
+) -> None:
     targets = [float(row["ground_truth_fraction_lost"]) for row in rows]
     series = (
         ("static_synthetic_fraction_lost", "Static Transolver, synthetic profiles"),
@@ -397,10 +403,27 @@ def _plot_parity(path: Path, rows: Sequence[dict[str, Any]]) -> None:
     upper += padding
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 10), constrained_layout=True)
-    for axis, (key, title) in zip(axes.flat, series):
+    pool_groups = (
+        ("Pool 1", "#2563eb", [row for row in rows if int(Path(str(row["sample_key"])).name.rsplit("_", 1)[1]) < 909]),
+        ("Pool 2", "#dc2626", [row for row in rows if int(Path(str(row["sample_key"])).name.rsplit("_", 1)[1]) >= 909]),
+    )
+    for axis_number, (axis, (key, title)) in enumerate(zip(axes.flat, series)):
         predictions = [float(row[key]) for row in rows]
         metrics = _metrics(rows, key)
-        axis.scatter(targets, predictions, s=22, alpha=0.7)
+        if pool_colored:
+            for pool_label, color, pool_rows in pool_groups:
+                axis.scatter(
+                    [float(row["ground_truth_fraction_lost"]) for row in pool_rows],
+                    [float(row[key]) for row in pool_rows],
+                    s=22,
+                    alpha=0.7,
+                    color=color,
+                    label=pool_label,
+                )
+            if axis_number == len(series) - 1:
+                axis.legend(loc="lower right", frameon=True, fontsize=9)
+        else:
+            axis.scatter(targets, predictions, s=22, alpha=0.7)
         axis.plot([lower, upper], [lower, upper], "k--", linewidth=1)
         axis.set(xlim=(lower, upper), ylim=(lower, upper))
         axis.set_xlabel("ASCOT5 fraction_lost")
@@ -414,7 +437,7 @@ def _plot_parity(path: Path, rows: Sequence[dict[str, Any]]) -> None:
             transform=axis.transAxes,
             va="top",
         )
-    fig.suptitle(f"Later/unseen ASCOT5 simulations (n={len(rows)})")
+    fig.suptitle(f"{title_prefix} ASCOT5 simulations (n={len(rows)})")
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200)
     plt.close(fig)
@@ -426,6 +449,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-folders", type=Path, default=split_root / "train_folders.txt")
     parser.add_argument("--val-folders", type=Path, default=split_root / "val_folders.txt")
     parser.add_argument("--later-folders", type=Path, default=split_root / "later_folders.txt")
+    parser.add_argument(
+        "--evaluation-folders",
+        type=Path,
+        help=(
+            "Manifest to evaluate instead of --later-folders. This is useful "
+            "for experiments whose held-out set is a random validation split."
+        ),
+    )
     parser.add_argument("--results-root", type=Path)
     parser.add_argument(
         "--temporal-run-dir",
@@ -476,9 +507,26 @@ def main() -> None:
 
     train_folders = _resolve_listed_folders(args.train_folders, results_root)
     val_folders = _resolve_listed_folders(args.val_folders, results_root)
-    later_folders = _resolve_listed_folders(args.later_folders, results_root)
-    validate_split_folders(train_folders, val_folders, later_folders)
-    selected_folders = later_folders[args.start_index :]
+    if args.evaluation_folders is None:
+        later_folders = _resolve_listed_folders(args.later_folders, results_root)
+        validate_split_folders(train_folders, val_folders, later_folders)
+        evaluation_folders = later_folders
+    else:
+        # A random train/validation experiment intentionally evaluates on its
+        # validation manifest. That manifest overlaps the validation group by
+        # design, so only require the training and validation groups themselves
+        # to remain disjoint in this mode.
+        later_folders = []
+        evaluation_folders = _resolve_listed_folders(args.evaluation_folders, results_root)
+        if not train_folders or not val_folders or not evaluation_folders:
+            raise ValueError("Training, validation, and evaluation folder lists must be nonempty.")
+        overlap = _folder_keys(train_folders) & _folder_keys(val_folders)
+        if overlap:
+            raise ValueError(
+                "The train and validation folder lists overlap; first duplicate: "
+                f"{sorted(overlap)[0]}"
+            )
+    selected_folders = evaluation_folders[args.start_index :]
     if args.max_samples is not None:
         selected_folders = selected_folders[: args.max_samples]
     if not selected_folders:
@@ -635,6 +683,7 @@ def main() -> None:
             "train": len(train_folders),
             "validation": len(val_folders),
             "later": len(later_folders),
+            "evaluation": len(evaluation_folders),
         },
         "checkpoints": {
             "temporal": str(temporal_checkpoint),

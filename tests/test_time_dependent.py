@@ -72,8 +72,8 @@ def test_ascot_temporal_windows_read_only_selected_frames_and_cache_static_data(
             bfield_file.create_dataset(name, data=np.full((2, 3), offset + 1.0))
     with h5py.File(folder / "afsi_initial.h5", "w") as afsi_file:
         distribution = afsi_file.create_group("afsi_distribution")
-        values = np.arange(1 * 2 * 1 * 3 * 2 * 1 * 1).reshape(1, 2, 1, 3, 2, 1, 1)
-        source = distribution.create_dataset("distribution_function", data=values)
+        afsi_values = np.arange(1 * 2 * 1 * 3 * 2 * 1 * 1).reshape(1, 2, 1, 3, 2, 1, 1)
+        source = distribution.create_dataset("distribution_function", data=afsi_values)
         source.attrs["dimensions"] = '["phi", "rho", "theta", "ekin", "xi", "time", "charge"]'
         coordinates = distribution.create_group("coordinates")
         coordinates.create_dataset("rho", data=[0.25, 0.75])
